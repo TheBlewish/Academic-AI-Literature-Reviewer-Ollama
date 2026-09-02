@@ -1,0 +1,46 @@
+# Academic-AI-Literature-Reviewer-Ollama — Python dependencies
+#
+# Install with:
+#     pip install -r requirements.txt
+#
+# Ollama itself is NOT a pip package. Install it separately from https://ollama.com
+# and pull a model before running this program.
+
+# ---------------------------------------------------------------------------
+# REQUIRED — the program will not start without these
+# ---------------------------------------------------------------------------
+
+# HTTP client for Ollama, all academic APIs, and PDF downloads
+requests>=2.31.0
+
+# Terminal colour output (the whole UI depends on it)
+colorama>=0.4.6
+
+# State-machine orchestration for the review pipeline
+langgraph>=0.2.0
+
+# ---------------------------------------------------------------------------
+# STRONGLY RECOMMENDED — core features silently degrade without these
+# ---------------------------------------------------------------------------
+
+# PDF text extraction. This is how papers actually get read.
+# Without it, only HTML/abstract sources work and most papers will be skipped.
+PyMuPDF>=1.23.0
+
+# BM25 retrieval, used by the document store to locate quote candidates
+# inside long papers. Without it, quote location falls back to slower scanning.
+rank-bm25>=0.2.2
+
+# HTML parsing for papers served as web pages rather than PDFs
+beautifulsoup4>=4.12.0
+
+# ---------------------------------------------------------------------------
+# OPTIONAL — extra fallbacks, safe to omit
+# ---------------------------------------------------------------------------
+
+# Secondary PDF extractor, tried if PyMuPDF fails on a malformed PDF
+pdfplumber>=0.10.0
+
+# Lets the document store read .docx files (not used by the paper pipeline,
+# inherited from the RAG modules this project reuses)
+python-docx>=1.1.0
