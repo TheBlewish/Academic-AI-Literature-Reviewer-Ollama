@@ -50,6 +50,14 @@ The output is a complete literature review with an introduction, methodology, ev
 - **Post-review Q&A** about the findings (toggleable)
 - **Graceful interrupt** — Ctrl+C aborts the active LLM call cleanly; press again to force-exit
 
+## Limitations
+
+I think it's important to note due to the amount of information processing this program does and the compute required not only are people without at least mid-level consumer hardware unable to use this, but for all systems the program does take a while to run.
+
+This is primarily as it was designed from the ground up to have any findings when run verified as accurate to the original author cited, and to achieve that additional steps requiring longer run times were instated so this is just me being upfront.
+
+So expect to leave it on in the background for a couple hours if doing some heavy research! 
+
 ## Installation
 
 ### 1. Clone the repository
