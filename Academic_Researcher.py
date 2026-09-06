@@ -85,6 +85,21 @@ from academic_config import (
 )
 from paper_discovery import PaperDiscoveryEngine, PaperMetadata
 from llm_manager import LLMManager, request_interrupt, clear_interrupt
+
+# Post-review interactive Q&A. Lives in its own module so the long main()
+# stays readable. Guarded so an older checkout without qa_session.py still
+# starts (it just reports that Q&A is unavailable instead of crashing).
+try:
+    from qa_session import run_qa_session
+    HAS_QA_SESSION = True
+except ImportError:
+    HAS_QA_SESSION = False
+
+    def run_qa_session(pipeline, results):  # type: ignore[misc]
+        print("Q&A mode unavailable: qa_session.py is missing from the "
+              "project folder. Download it from the repository and place "
+              "it next to Academic_Researcher.py.")
+        return "new"
 from research_planner import ResearchPlanner, ResearchPlan, FocusArea
 from study_analyser import StudyAnalyser
 from reference_harvester import ReferenceHarvester
@@ -4117,7 +4132,7 @@ OUTPUT ONLY THE REVISED REVIEW — no preamble or markdown fences."""
     # ---------- Verification convergence helpers ----------
 
     def _super_critical_quote_rules(self) -> str:
-        """The strongest possible framing by design: hand-typing any
+        """The strongest possible framing (per James's spec): hand-typing any
         quotation, or copying evidence-base display text, is a SUPER-CRITICAL,
         review-breaking error that blocks the review from passing."""
         return (
@@ -6066,7 +6081,12 @@ Respond with ONLY the title text."""
                       "papers_found": len(self.discovery.paper_catalog),
                       "papers_with_full_text": len(self.discovery.get_full_text_papers()),
                       "studies_analyzed": len(final.get("study_analyses", [])),
-                      "elapsed_time": elapsed}
+                      "elapsed_time": elapsed,
+                      # The complete final graph state, so post-review Q&A can
+                      # ground its answers in the actual analysed studies and
+                      # quote registry instead of a truncated slice of prose.
+                      # Additive only — every pre-existing key is unchanged.
+                      "state": final}
         finally:
             # Always close + name the log, even if the run errored or was
             # interrupted, so partial runs are still captured for debugging.
@@ -6198,21 +6218,21 @@ def main():
             # (default) it behaves exactly as before.
             qa_enabled = bool(pipeline.config.get("qa_mode_enabled", True))
             if results.get("review") and qa_enabled:
-                print(f"\n{Fore.CYAN}Q&A mode ('new'/'quit'){Style.RESET_ALL}")
-                while True:
-                    fu = input(f"{Fore.GREEN}Q&A> {Style.RESET_ALL}").strip()
-                    if not fu or fu.lower() in ('new', 'quit', 'exit', 'q'):
-                        break
-                    r = pipeline.agent_manager.run_primary(
-                        f'Answer from this review: "{fu}"\n\n{results["review"][:10000]}',
-                        task="qa_mode")
-                    if r.success:
-                        print(f"\n{Fore.WHITE}{r.response}{Style.RESET_ALL}")
-                if fu and fu.lower() in ('quit', 'exit', 'q'):
+                # The Q&A session now lives in qa_session.run_qa_session().
+                # It returns "quit" (leave the program) or "new" (ask another
+                # research question). See qa_session.py for the full list of
+                # bugs this replaces — chiefly the stale interrupt flag that
+                # silently disabled every answer after a single Ctrl-C, and the
+                # missing else-branch that swallowed every error.
+                if run_qa_session(pipeline, results) == "quit":
                     break
             elif results.get("review") and not qa_enabled:
                 print(f"\n{Fore.WHITE}Q&A mode is disabled in config — review complete. "
                       f"Enter another question or 'quit'.{Style.RESET_ALL}")
+            elif not results.get("review"):
+                print(f"\n{Fore.YELLOW}No review was produced this run, so there "
+                      f"is nothing for Q&A to answer from. Check the session log "
+                      f"in the Logs folder for what went wrong.{Style.RESET_ALL}")
         except EOFError:
             break
         except KeyboardInterrupt:
