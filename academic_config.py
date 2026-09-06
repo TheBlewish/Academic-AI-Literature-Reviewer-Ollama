@@ -16,26 +16,13 @@ import os
 # PRIMARY LLM CONFIG (Analysis, Planning, Synthesis, Verification)
 # =============================================================================
 
-# ---- SET THESE TWO VALUES BEFORE YOUR FIRST RUN ----
-#
-# base_url : where your Ollama server is listening.
-#     * Ollama running on THIS machine   -> "http://localhost:11434"  (default)
-#     * Ollama on another box on your LAN -> "http://192.168.1.50:11434"
-#     * Ollama over Tailscale/VPN         -> "http://your-host.your-tailnet.ts.net:11434"
-#   You can also leave this alone and set the OLLAMA_BASE_URL environment
-#   variable instead, which takes precedence:
-#       export OLLAMA_BASE_URL="http://192.168.1.50:11434"
-#
-# model_name : the EXACT tag of a model you have already pulled in Ollama.
-#   Check what you have with:  ollama list
-#   This program is context-hungry. A model with a large context window and
-#   strong reasoning is strongly recommended — a 30B-class model at ~64K
-#   context is the sweet spot on a high-memory machine. See the README for
-#   sizing guidance and for the low-end (small machine) mode below.
 PRIMARY_LLM_CONFIG = {
     "llm_type": "ollama",
-    "base_url": os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
-    "model_name": os.environ.get("OLLAMA_MODEL", "qwen3.5:35b"),
+    # NOTE: default is the local Ollama on THIS machine. If you run the program
+    # on one box and Ollama on another, put that machine's address here
+    # instead, e.g. "http://192.168.1.50:11434" or a Tailscale hostname.
+    "base_url": "http://localhost:11434",
+    "model_name": "qwen3.5:35b",
     "temperature": 0.1,
     "top_p": 0.9,
     "n_ctx": 65536,
@@ -71,7 +58,7 @@ THINKING_CONFIG = {
 }
 
 # =============================================================================
-# LOW-END DEVICE MODE  (chunked execution for small / low-memory machines)
+# LOW-END DEVICE MODE  (chunked execution for small machines, e.g. a NucBox)
 # =============================================================================
 # The FULL program is unchanged by default. Set low_end_device_mode to "yes" to
 # run complete reviews on a small-context device: every LLM call is capped to
@@ -93,43 +80,76 @@ THINKING_CONFIG = {
 # therefore reviews a focused corpus rather than a 200-paper sweep. Raise these
 # caps if your small device has more headroom.
 LOW_END_CONFIG = {
-    # MASTER TOGGLE — simple yes/no. "no" (default) = full behaviour, unchanged,
-    # for the big machine. "yes" = chunked low-end mode for a small device.
+    # MASTER TOGGLE — simple yes/no. "no" = full behaviour, unchanged, for the
+    # big machine (Strix Halo / 128GB). "yes" = chunked low-end mode for a small
+    # device. THIS IS THE ONLY LINE YOU CHANGE TO SWITCH BETWEEN MACHINES.
+    #
+    # Currently: "no" — FULL MODE. Nothing else in this dict is read, and
+    # PRIMARY_LLM_CONFIG below takes over completely: full context window, the
+    # full corpus, and unchunked deep analysis (the whole paper in one call).
+    #
+    # Set to "yes" for a small machine (tested on a GMKtec NucBox M6 Ultra:
+    # Ryzen 5 7640HS, Radeon 760M iGPU, 16GB RAM). That switches on chunked
+    # deep analysis and the reduced budgets below.
     "low_end_device_mode": "no",
 
     # Context window of the small device's model. Every call is capped here and
     # the chunk budgets below keep each call's input comfortably under it.
-    # 8192 is a safe value for a 16GB mini-PC / laptop class machine running a
-    # ~14B model at a low quant, which is fast at 8K. Raise to 16384 if your
-    # small device has more headroom — the chunk sizes below still fit a 16K
-    # window.
+    # 8192 is right for a 9B model on 11.5GB usable RAM. Raise to 16384 only if
+    # you free up memory; the chunk sizes below still fit a 16K window.
     "n_ctx": 8192,
 
-    # OPTIONAL endpoint / model overrides for the small device. Leave BLANK ("")
-    # to keep the PRIMARY_LLM_CONFIG values (e.g. if the same Ollama endpoint
-    # serves the small model). Fill these if the small device differs.
-    "base_url": "",
-    "model_name": "",
+    # Endpoint / model overrides for the small device. Leave BLANK ("") to keep
+    # the PRIMARY_LLM_CONFIG values. Filled here so the NucBox talks to its OWN
+    # local Ollama instead of the Strix Halo box over Tailscale.
+    "base_url": "http://localhost:11434",
+    "model_name": "qwen3.5:9b",
 
-    # ---- Chunk budgets (characters; ~3 chars/token) ----
+    # ---- Chunk budgets (characters; ~3.6 chars/token) ----
     # deep_analysis: sequential paper chunk size + overlap between chunks.
-    # Sized for an 8K window: ~6000 chars (~2000 tok) + prompt scaffolding
-    # (~470 tok) + the 2048-tok output budget + safety/headroom all fit under
-    # 8192 with room to spare (computed need ~7200 tok). A 500-char overlap
-    # keeps sentences that straddle a chunk boundary recoverable in one chunk.
-    # If you raise n_ctx above to 16384 you may raise this to 9000 to read each
-    # paper in fewer passes.
-    "deep_analysis_chunk_chars": 6000,
-    "deep_analysis_chunk_overlap": 500,
-    # synthesis MAP: max evidence characters per study-batch.
-    "synthesis_map_batch_chars": 6000,
-    # synthesis REDUCE: max combined draft characters per assembly group; if the
-    # batch drafts exceed this they are merged hierarchically in groups first.
-    "synthesis_reduce_group_chars": 7000,
+    #
+    # BUDGET ARITHMETIC for the 8192 window (deep_analysis_low_end profile):
+    #     prompt scaffolding (measured)      ~1,140 tok
+    #     paper chunk  10,000 chars / 3.6    ~2,780 tok
+    #     output budget (max_tokens)          2,048 tok
+    #     safety headroom                      ~400 tok
+    #                                        -----------
+    #     total                              ~6,370 tok  of 8,192  -> fits
+    #
+    # 10,000 (rather than the old 6,000) is deliberate: it nearly halves the
+    # number of LLM calls per paper, which is the single biggest driver of run
+    # time on a mini PC, while still leaving ~1,800 tokens of slack.
+    #
+    # The 600-char overlap keeps a sentence that straddles a chunk boundary
+    # recoverable whole in the following chunk — important because a half
+    # sentence can never pass verbatim verification.
+    "deep_analysis_chunk_chars": 10000,
+    "deep_analysis_chunk_overlap": 600,
+
+    # Hard ceiling on LLM calls spent reading ONE paper. 4 chunks x 9,400 net
+    # chars covers ~37,600 characters (roughly 15 pages) — the whole of a typical
+    # journal article's body. Papers longer than that lose their tail, which is
+    # usually references and appendices. 0 = unlimited (slow; not advised here).
+    "max_chunks_per_paper": 4,
+
+    # Spend one extra SMALL call per paper merging the per-chunk study summaries
+    # into the single 2-4 sentence paraphrase synthesis uses to introduce the
+    # study. Set False to skip the call and use the longest chunk summary
+    # instead — saves ~1 call per paper at some cost to that intro's quality.
+    "merge_study_summary": True,
+
+    # Cap on how much of a paper is read at all. The full-mode default is 50,000
+    # chars; with 4 chunks of 10,000 there is no point loading more than the
+    # chunker will reach. Verification still runs against the COMPLETE text.
+    "max_study_text_length": 40000,
 
     # ---- Corpus caps so discovery-stage holistic calls fit the small window ----
-    "max_total_papers": 60,
+    # Tuned DOWN from the original 60/3 so a run on the NucBox finishes in hours
+    # rather than a day. See SETUP_NUCBOX.md for the demo-speed preset.
+    "max_total_papers": 25,
     "target_papers_per_focus_area": 3,
+    "max_discovery_rounds": 5,
+    "num_focus_areas": 4,
 }
 
 # =============================================================================
@@ -176,7 +196,7 @@ TASK_PROFILES = {
     # e.g. 8192) caps it lower anyway. The output budget is small (2048) so that
     # one ~6000-char chunk + the prompt scaffolding + this output all fit inside
     # an 8K window without the no-truncation guarantee having to push the window
-    # above the device's limit. think is off (a small instruct model on a low-end box
+    # above the device's limit. think is off (a small instruct model on a NucBox
     # should not burn the tiny budget on a <think> block). This profile is NEVER
     # consulted in full mode — deep_analysis only requests it under low-end.
     "deep_analysis_low_end": {
@@ -318,47 +338,6 @@ TASK_PROFILES = {
 # =============================================================================
 # ACADEMIC SEARCH API CONFIG (all FREE)
 # =============================================================================
-#
-# ---- YOU MUST SUPPLY YOUR OWN EMAIL ADDRESS BELOW ----
-#
-# OpenAlex, Unpaywall and Crossref are free and need no signup, but they ask
-# that you identify yourself with a contact email so they can reach you if your
-# script misbehaves. Unpaywall REJECTS requests from "example.com" outright, so
-# leaving the placeholder in will disable full-text discovery via Unpaywall.
-#
-# Use ANY real address you own — a personal Gmail/Outlook/Proton address is
-# fine, it does not have to be a university one. Two ways to set it:
-#
-#   1. Environment variables (recommended — keeps your address out of the repo,
-#      so you can never accidentally commit it):
-#         export OPENALEX_EMAIL="you@yourdomain.com"
-#         export UNPAYWALL_EMAIL="you@yourdomain.com"
-#         export CROSSREF_EMAIL="you@yourdomain.com"
-#
-#   2. Or just edit the three "your.email@example.com" strings below directly.
-#      If you do this, be careful not to commit the change back to a public
-#      repository.
-#
-# ---- OPTIONAL API KEYS ----
-#
-# Both of these are optional. The program works without them; they simply
-# raise your rate limits / unlock an extra source.
-#
-#   SEMANTIC_SCHOLAR_API_KEY — free key, request one at:
-#         https://www.semanticscholar.org/product/api
-#      Without a key, Semantic Scholar is heavily rate-limited and the program
-#      will disable it after repeated 429s (this is expected, not a bug).
-#
-#   CORE_API_KEY — free key, register at:
-#         https://core.ac.uk/services/api
-#      Without a key, the CORE source is skipped entirely.
-#
-# Set them the same way:
-#         export SEMANTIC_SCHOLAR_API_KEY="..."
-#         export CORE_API_KEY="..."
-#
-# NEVER paste an API key directly into this file if you intend to push your
-# copy of the repo anywhere public.
 
 SEARCH_APIS = {
     "semantic_scholar": {
@@ -373,7 +352,7 @@ SEARCH_APIS = {
     "openalex": {
         "enabled": True,
         "base_url": "https://api.openalex.org",
-        "email": os.environ.get("OPENALEX_EMAIL", "your.email@example.com"),
+        "email": os.environ.get("OPENALEX_EMAIL", "shadefrog@duck.com"),
         "results_per_page": 25,
         "max_pages": 3,
         "rate_limit_delay": 0.2,
@@ -389,7 +368,7 @@ SEARCH_APIS = {
     "unpaywall": {
         "enabled": True,
         "base_url": "https://api.unpaywall.org/v2",
-        "email": os.environ.get("UNPAYWALL_EMAIL", "your.email@example.com"),
+        "email": os.environ.get("UNPAYWALL_EMAIL", "shadefrog@duck.com"),
         "rate_limit_delay": 0.1,
     },
     "europe_pmc": {
@@ -402,7 +381,7 @@ SEARCH_APIS = {
     "crossref": {
         "enabled": True,
         "base_url": "https://api.crossref.org",
-        "email": os.environ.get("CROSSREF_EMAIL", "your.email@example.com"),
+        "email": os.environ.get("CROSSREF_EMAIL", "shadefrog@duck.com"),
         "results_per_page": 20,
         "max_pages": 2,
         "rate_limit_delay": 0.15,
@@ -666,6 +645,15 @@ def get_research_config():
         cfg["low_end_n_ctx"] = le.get("n_ctx", 16384)
         cfg["low_end_deep_analysis_chunk_chars"] = le.get("deep_analysis_chunk_chars", 9000)
         cfg["low_end_deep_analysis_chunk_overlap"] = le.get("deep_analysis_chunk_overlap", 500)
+        # Consumed by study_analyser.StudyAnalyser for chunked deep analysis.
+        cfg["low_end_max_chunks_per_paper"] = le.get("max_chunks_per_paper", 4)
+        cfg["low_end_merge_study_summary"] = le.get("merge_study_summary", True)
+        # Low-end overrides for existing RESEARCH_CONFIG keys. Applied here (not
+        # by editing RESEARCH_CONFIG) so full mode is untouched.
+        for _k in ("max_study_text_length", "max_discovery_rounds",
+                   "num_focus_areas"):
+            if le.get(_k) is not None:
+                cfg[_k] = le[_k]
         cfg["low_end_synthesis_map_batch_chars"] = le.get("synthesis_map_batch_chars", 9000)
         cfg["low_end_synthesis_reduce_group_chars"] = le.get("synthesis_reduce_group_chars", 11000)
         return cfg
