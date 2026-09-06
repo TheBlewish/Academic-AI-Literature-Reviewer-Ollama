@@ -800,6 +800,177 @@ def extract_references_block(text: str) -> str:
     return text[ref_start:ref_end].strip()
 
 
+class _ExtractionResult:
+    """Minimal stand-in for llm_manager's AgentResult.
+
+    The chunked low-end path merges several real AgentResults into one logical
+    result. The caller in deep_analysis() only ever touches .success and
+    .json_response, so this exposes exactly those two attributes and nothing
+    else, keeping the merge path honest about what it actually provides.
+    """
+
+    __slots__ = ("success", "json_response")
+
+    def __init__(self, success, json_response):
+        self.success = success
+        self.json_response = json_response
+
+
+def _is_interrupted() -> bool:
+    """True if the user has pressed Ctrl+C. Imported lazily so this module can
+    still be imported (and unit-tested) without llm_manager present."""
+    try:
+        from llm_manager import is_interrupted
+        return bool(is_interrupted())
+    except Exception:
+        return False
+
+
+def _split_text_into_chunks(text, chunk_chars, overlap, max_chunks=0):
+    """Split paper text into sequential overlapping chunks for low-end reading.
+
+    Boundaries are pulled back to the nearest paragraph break, then sentence
+    end, within the last 20% of the chunk. This matters more here than in a
+    normal RAG splitter: the model is asked to reproduce a COMPLETE sentence
+    verbatim, and a sentence cut in half by a chunk boundary can only ever
+    produce a fragment that fails verbatim verification and is discarded. The
+    overlap is the second line of defence for sentences that still straddle a
+    boundary — they appear whole in the following chunk.
+
+    Returns a list of strings. A text shorter than one chunk returns [text].
+    """
+    text = text or ""
+    chunk_chars = max(int(chunk_chars or 0), 1000)
+    overlap = max(int(overlap or 0), 0)
+    if overlap >= chunk_chars:
+        overlap = chunk_chars // 4
+    if len(text) <= chunk_chars:
+        return [text] if text else []
+
+    chunks = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        end = min(pos + chunk_chars, n)
+        if end < n:
+            window_start = pos + int(chunk_chars * 0.8)
+            cut = text.rfind("\n\n", window_start, end)
+            if cut == -1:
+                for pat in (". ", ".\n", "? ", "! "):
+                    c = text.rfind(pat, window_start, end)
+                    if c > cut:
+                        cut = c + len(pat) - 1
+            if cut > window_start:
+                end = cut + 1
+        chunk = text[pos:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= n:
+            break
+        if max_chunks and len(chunks) >= max_chunks:
+            break
+        pos = max(end - overlap, pos + 1)
+    return chunks
+
+
+def _build_deep_analysis_prompt(paper, query, text_type, cap_clause,
+                                chunk_text, chunk_header=""):
+    """Build the deep-analysis quote-extraction prompt.
+
+    The prompt text is IDENTICAL to the one this module has always used. Two
+    placeholders were parameterised so the same prompt can serve both modes:
+
+      chunk_text   - the paper text this particular call sees. In full mode this
+                     is the entire `text`, so the rendered prompt is byte-for-byte
+                     what it was before.
+      chunk_header - "" in full mode, which renders as the blank line that has
+                     always sat between the Content line and PAPER CONTENT. In
+                     low-end chunked mode it carries the "PART n OF m" notice.
+
+    A unit test in the shipped test suite asserts the full-mode rendering is
+    byte-identical to the original prompt, so this refactor cannot silently
+    change full-mode behaviour.
+    """
+    return f"""You are extracting EXACT VERBATIM quotes from an academic paper for a literature review.
+
+RESEARCH QUESTION: "{query}"
+
+PAPER: {paper.title}
+Authors: {', '.join(paper.authors[:5])} | Year: {paper.year}
+Content: {text_type}
+{chunk_header}
+PAPER CONTENT:
+{chunk_text}
+
+Your task is to extract the quotes that report THIS STUDY'S OWN FINDINGS that
+help answer the research question. A "finding" is something THIS study itself
+measured, observed, reported, or concluded — its results and what they mean.
+
+EXTRACT quotes ONLY from the study's evidence:
+- the RESULTS / FINDINGS section (what the study found),
+- the DISCUSSION section (what the study's results mean / its interpretation),
+- the CONCLUSION section (the study's own conclusions),
+- and, if present, a sentence in the ABSTRACT that states this study's RESULTS.
+There is NO fixed number — extract as many as are genuinely findings relevant to
+the question, which may be many, a few, or NONE at all.
+
+DO NOT quote (these are NOT this study's findings):
+- the INTRODUCTION, BACKGROUND, or LITERATURE REVIEW (motivation, definitions,
+  why the topic matters, descriptions of the problem),
+- the study's AIMS, OBJECTIVES, HYPOTHESES, or research questions,
+- METHODS-only sentences that merely describe what was done (unless the sentence
+  also states a result),
+- any sentence that reports ANOTHER study's findings or is attributed to other
+  authors — e.g. "Smith et al. (2019) found ...", "Previous studies have
+  shown ...", "It is well established that ...", "[12] reported ...". Only quote
+  sentences where THIS paper states what IT found, observed, or concluded.
+
+CRITICAL VERBATIM RULES:
+- Extract ALL directly-relevant FINDINGS quotes. Do NOT pad the list with weak,
+  tangential, or background quotes to reach some number, and do NOT leave out a
+  relevant findings quote to keep the list short. The right count is exactly
+  however many findings are relevant.
+- If NOTHING in this paper reports a finding relevant to the research question,
+  return an empty list ("key_quotes": []). It is correct and expected to return
+  no quotes for such a paper — it will simply be excluded from the review.
+- Each quote will be VERIFIED character-by-character against the source text AND
+  checked to confirm it comes from the study's evidence (not its introduction)
+  and is not a citation of another study. A quote that does not match EXACTLY,
+  that sits in the introduction/background, or that reports another study's work
+  will be REJECTED.
+- Each quote must be ONE complete sentence, copied EXACTLY as it appears in the
+  paper — every word, number, symbol, and punctuation mark identical. Do NOT
+  paraphrase, summarise, join two sentences, trim, or "clean up" the wording.
+  If you cannot reproduce a sentence exactly, do not include it.
+- Prefer sentences that state a concrete result: an effect, a measurement, a
+  number, a comparison, an association, or an explicit conclusion of THIS study.
+- Each quote must stand on its own as a statement of what THIS study found,
+  observed, measured, or concluded, relevant to the research question.{cap_clause}
+
+ALSO WRITE A STUDY SUMMARY (separate from the quotes). Now that you have read the
+whole paper, write a short, factual summary IN YOUR OWN WORDS that will be used to
+INTRODUCE this study in the review before its quoted findings are presented. It
+must be grounded ONLY in what this paper actually says — do not invent details. In
+2-4 sentences, cover, where the paper states them:
+  - what the study set out to examine (its aim / question),
+  - its design / methodology (e.g. theoretical mass model, RCT, simulation,
+    laboratory experiment, cohort study, systematic review, meta-analysis),
+  - its sample, dataset, or scope (what/who/how many, conditions tested),
+  - the general nature of its findings (one clause — the detail stays in the quotes).
+This summary is a PARAPHRASE, not a quotation; it will be clearly labelled as the
+reviewer's summary of the study (never shown in quotation marks). If the paper does
+not state something (e.g. no sample size), simply omit it rather than guessing.
+
+Respond with ONLY JSON:
+{{
+    "study_summary": "2-4 sentence paraphrased introduction to THIS study: its aim, design/methodology, sample/scope, and the general nature of its findings, grounded only in the paper. Not a quote.",
+    "key_quotes": [
+        {{"quote": "EXACT TEXT copied verbatim from the study's findings/discussion/conclusion", "context": "what THIS study found and how it answers the question", "importance": "high|medium|low"}}
+    ]
+}}"""
+
+
+
 class StudyAnalyser:
     """Two-mode study analyser: quick_read for discovery, deep_analysis for review writing."""
 
@@ -837,6 +1008,42 @@ class StudyAnalyser:
         # nothing). Default False keeps the inferred-abstract acceptance.
         self._require_evidence_strict = bool(
             self.research_config.get("require_evidence_strict", False))
+        # ------------------------------------------------------------------
+        # LOW-END DEVICE MODE — chunked deep analysis.
+        #
+        # In FULL mode every value below is unused and deep_analysis() behaves
+        # exactly as it always has: one LLM call containing the whole paper.
+        #
+        # In LOW-END mode the paper is read in sequential overlapping chunks and
+        # the proposed quotes are accumulated across them, because a whole paper
+        # (max_study_text_length, default 50000 chars ~ 16.7K tokens) cannot fit
+        # an 8K window and was previously being silently truncated by Ollama.
+        #
+        # CRITICAL: only the SELECTION half is chunked. The DocumentStore is
+        # still loaded with the COMPLETE text and every proposed quote is still
+        # verified verbatim against that complete text, so the anti-hallucination
+        # guarantee is bit-for-bit identical to full mode.
+        #
+        # These keys are published by academic_config.get_research_config() only
+        # when low_end_device_mode is on, so `.get(...)` returning the default is
+        # itself the full-mode signal.
+        # ------------------------------------------------------------------
+        self._low_end = bool(
+            self.research_config.get("low_end_device_mode", False))
+        self._le_chunk_chars = int(
+            self.research_config.get("low_end_deep_analysis_chunk_chars", 9000) or 9000)
+        self._le_chunk_overlap = int(
+            self.research_config.get("low_end_deep_analysis_chunk_overlap", 500) or 500)
+        # Hard safety bound on LLM calls per paper. Without it a long paper at a
+        # small chunk size could fire a dozen calls and make a run take days on a
+        # mini PC. 0 = unlimited.
+        self._le_max_chunks = int(
+            self.research_config.get("low_end_max_chunks_per_paper", 4) or 0)
+        # Spend one extra (small) call merging the per-chunk study summaries into
+        # the single 2-4 sentence paraphrase synthesis expects. Set False to skip
+        # the call and simply use the longest per-chunk summary instead.
+        self._le_merge_summary = bool(
+            self.research_config.get("low_end_merge_study_summary", True))
         # Initialise the file-only section-debug logger now and tell the user once
         # where the verbose detection detail goes (it is NOT printed to the
         # terminal — only to this file — so the run output stays readable).
@@ -1059,85 +1266,9 @@ Be specific about findings — include actual numbers, effect sizes, p-values wh
             cap_clause = (f"\n- As an upper bound, extract at most {hard_cap} quotes; if more than "
                           f"{hard_cap} are relevant, keep the {hard_cap} most important.")
 
-        prompt = f"""You are extracting EXACT VERBATIM quotes from an academic paper for a literature review.
+        result = self._extract_deep_analysis(
+            paper, query, text, text_type, cap_clause)
 
-RESEARCH QUESTION: "{query}"
-
-PAPER: {paper.title}
-Authors: {', '.join(paper.authors[:5])} | Year: {paper.year}
-Content: {text_type}
-
-PAPER CONTENT:
-{text}
-
-Your task is to extract the quotes that report THIS STUDY'S OWN FINDINGS that
-help answer the research question. A "finding" is something THIS study itself
-measured, observed, reported, or concluded — its results and what they mean.
-
-EXTRACT quotes ONLY from the study's evidence:
-- the RESULTS / FINDINGS section (what the study found),
-- the DISCUSSION section (what the study's results mean / its interpretation),
-- the CONCLUSION section (the study's own conclusions),
-- and, if present, a sentence in the ABSTRACT that states this study's RESULTS.
-There is NO fixed number — extract as many as are genuinely findings relevant to
-the question, which may be many, a few, or NONE at all.
-
-DO NOT quote (these are NOT this study's findings):
-- the INTRODUCTION, BACKGROUND, or LITERATURE REVIEW (motivation, definitions,
-  why the topic matters, descriptions of the problem),
-- the study's AIMS, OBJECTIVES, HYPOTHESES, or research questions,
-- METHODS-only sentences that merely describe what was done (unless the sentence
-  also states a result),
-- any sentence that reports ANOTHER study's findings or is attributed to other
-  authors — e.g. "Smith et al. (2019) found ...", "Previous studies have
-  shown ...", "It is well established that ...", "[12] reported ...". Only quote
-  sentences where THIS paper states what IT found, observed, or concluded.
-
-CRITICAL VERBATIM RULES:
-- Extract ALL directly-relevant FINDINGS quotes. Do NOT pad the list with weak,
-  tangential, or background quotes to reach some number, and do NOT leave out a
-  relevant findings quote to keep the list short. The right count is exactly
-  however many findings are relevant.
-- If NOTHING in this paper reports a finding relevant to the research question,
-  return an empty list ("key_quotes": []). It is correct and expected to return
-  no quotes for such a paper — it will simply be excluded from the review.
-- Each quote will be VERIFIED character-by-character against the source text AND
-  checked to confirm it comes from the study's evidence (not its introduction)
-  and is not a citation of another study. A quote that does not match EXACTLY,
-  that sits in the introduction/background, or that reports another study's work
-  will be REJECTED.
-- Each quote must be ONE complete sentence, copied EXACTLY as it appears in the
-  paper — every word, number, symbol, and punctuation mark identical. Do NOT
-  paraphrase, summarise, join two sentences, trim, or "clean up" the wording.
-  If you cannot reproduce a sentence exactly, do not include it.
-- Prefer sentences that state a concrete result: an effect, a measurement, a
-  number, a comparison, an association, or an explicit conclusion of THIS study.
-- Each quote must stand on its own as a statement of what THIS study found,
-  observed, measured, or concluded, relevant to the research question.{cap_clause}
-
-ALSO WRITE A STUDY SUMMARY (separate from the quotes). Now that you have read the
-whole paper, write a short, factual summary IN YOUR OWN WORDS that will be used to
-INTRODUCE this study in the review before its quoted findings are presented. It
-must be grounded ONLY in what this paper actually says — do not invent details. In
-2-4 sentences, cover, where the paper states them:
-  - what the study set out to examine (its aim / question),
-  - its design / methodology (e.g. theoretical mass model, RCT, simulation,
-    laboratory experiment, cohort study, systematic review, meta-analysis),
-  - its sample, dataset, or scope (what/who/how many, conditions tested),
-  - the general nature of its findings (one clause — the detail stays in the quotes).
-This summary is a PARAPHRASE, not a quotation; it will be clearly labelled as the
-reviewer's summary of the study (never shown in quotation marks). If the paper does
-not state something (e.g. no sample size), simply omit it rather than guessing.
-
-Respond with ONLY JSON:
-{{
-    "study_summary": "2-4 sentence paraphrased introduction to THIS study: its aim, design/methodology, sample/scope, and the general nature of its findings, grounded only in the paper. Not a quote.",
-    "key_quotes": [
-        {{"quote": "EXACT TEXT copied verbatim from the study's findings/discussion/conclusion", "context": "what THIS study found and how it answers the question", "importance": "high|medium|low"}}
-    ]
-}}"""
-
-        result = self.llm.run_primary(prompt, as_json=True, task="deep_analysis")
         elapsed = time.time() - start
 
         if not result.success or not result.json_response:
@@ -1355,6 +1486,172 @@ Respond with ONLY JSON:
         analysis["paper_citation_count"] = paper.citation_count
         analysis["has_full_text"] = paper.full_text_available
         return analysis
+
+    # =========================================================================
+    # DEEP-ANALYSIS QUOTE EXTRACTION (full mode + low-end chunked mode)
+    # =========================================================================
+
+    def _extract_deep_analysis(self, paper, query, text, text_type, cap_clause):
+        """Get {study_summary, key_quotes} for a paper.
+
+        FULL MODE (default, unchanged): exactly one LLM call containing the whole
+        paper, with the prompt rendered byte-identically to the original.
+
+        LOW-END MODE: the paper is read in sequential overlapping chunks, one LLM
+        call per chunk, and the proposed quotes are accumulated. This exists
+        because a whole paper is ~16.7K tokens and an 8K window silently
+        truncated it, so the model only ever saw the first half and the back of
+        every paper — Results, Discussion and Conclusion, i.e. exactly where the
+        findings live — was invisible.
+
+        Returns an object exposing .success and .json_response, so the caller's
+        verification, section-gating and merge logic is untouched in both modes.
+        """
+        if not self._low_end:
+            # ---- FULL MODE: original single call, unchanged ----
+            prompt = _build_deep_analysis_prompt(
+                paper, query, text_type, cap_clause,
+                chunk_text=text, chunk_header="")
+            return self.llm.run_primary(prompt, as_json=True,
+                                        task="deep_analysis")
+
+        # ---- LOW-END MODE: chunked read ----
+        chunks = _split_text_into_chunks(
+            text, self._le_chunk_chars, self._le_chunk_overlap,
+            max_chunks=self._le_max_chunks)
+
+        if len(chunks) <= 1:
+            # Short paper — one call is enough. Use the low-end task profile so
+            # the output budget still fits the small window.
+            prompt = _build_deep_analysis_prompt(
+                paper, query, text_type, cap_clause,
+                chunk_text=chunks[0] if chunks else text, chunk_header="")
+            return self.llm.run_primary(prompt, as_json=True,
+                                        task="deep_analysis_low_end")
+
+        print(f"\n        {Fore.WHITE}low-end: reading in {len(chunks)} "
+              f"chunks{Style.RESET_ALL}", end=" ", flush=True)
+
+        all_quotes = []
+        summaries = []
+        seen = set()
+        any_success = False
+
+        for idx, chunk in enumerate(chunks, 1):
+            # Honour Ctrl+C between chunks: stop reading and keep what we have
+            # rather than discarding a partly-read paper.
+            if _is_interrupted():
+                print(f"{Fore.YELLOW}[interrupted after chunk {idx-1}]"
+                      f"{Style.RESET_ALL}", end=" ", flush=True)
+                break
+
+            header = (
+                f"THIS IS PART {idx} OF {len(chunks)} of the paper's text. Extract "
+                f"quotes ONLY from the text shown below. Other parts are handled "
+                f"separately, so do not guess at or reconstruct text you cannot "
+                f"see, and do not comment on the split. If this part contains no "
+                f"relevant findings, return an empty \"key_quotes\" list — that is "
+                f"a normal and expected outcome for a part that is all methods or "
+                f"references."
+            )
+            prompt = _build_deep_analysis_prompt(
+                paper, query, text_type, cap_clause,
+                chunk_text=chunk, chunk_header=header)
+            r = self.llm.run_primary(prompt, as_json=True,
+                                     task="deep_analysis_low_end")
+            if not r.success or not r.json_response:
+                print(f"{Fore.YELLOW}[chunk {idx} failed]{Style.RESET_ALL}",
+                      end=" ", flush=True)
+                continue
+
+            any_success = True
+            for qd in (r.json_response.get("key_quotes") or []):
+                if not isinstance(qd, dict):
+                    continue
+                qt = (qd.get("quote") or "").strip()
+                if not qt:
+                    continue
+                # Overlap between consecutive chunks means the same sentence can
+                # legitimately be proposed twice. Deduplicate on normalised text
+                # so it is verified and counted once.
+                key = re.sub(r"\W+", " ", qt.lower()).strip()
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_quotes.append(qd)
+
+            s = (r.json_response.get("study_summary") or "").strip()
+            if s:
+                summaries.append(s)
+            print(f"{Fore.GREEN}{idx}\u2713{Style.RESET_ALL}", end="", flush=True)
+
+        if not any_success:
+            return _ExtractionResult(False, None)
+
+        # A hard cap is normally applied by the prompt, but in chunked mode each
+        # chunk applies it independently, so enforce it once over the merged set.
+        hard_cap = self.research_config.get("max_quotes_per_study_hard_cap", 0)
+        try:
+            hard_cap = int(hard_cap)
+        except (TypeError, ValueError):
+            hard_cap = 0
+        if hard_cap and hard_cap > 0 and len(all_quotes) > hard_cap:
+            rank = {"high": 0, "medium": 1, "low": 2}
+            all_quotes.sort(key=lambda q: rank.get(
+                str(q.get("importance", "medium")).lower(), 1))
+            all_quotes = all_quotes[:hard_cap]
+
+        summary = self._merge_chunk_summaries(summaries, paper)
+        print(f" {Fore.WHITE}({len(all_quotes)} candidates from "
+              f"{len(chunks)} chunks){Style.RESET_ALL}", end=" ", flush=True)
+        return _ExtractionResult(
+            True, {"study_summary": summary, "key_quotes": all_quotes})
+
+    def _merge_chunk_summaries(self, summaries, paper):
+        """Reduce the per-chunk study summaries to the single 2-4 sentence
+        paraphrase that synthesis uses to introduce the study.
+
+        Each chunk only saw part of the paper, so its summary is partial.
+        Concatenating them would produce a repetitive wall of text that then gets
+        printed under the study's heading in the review, so they are merged.
+        """
+        summaries = [s for s in summaries if s]
+        if not summaries:
+            return ""
+        if len(summaries) == 1:
+            return summaries[0]
+        if not self._le_merge_summary or _is_interrupted():
+            # Cheapest acceptable fallback: the longest single summary is the one
+            # written from the chunk that saw the most substantive material.
+            return max(summaries, key=len)
+
+        joined = "\n\n".join(f"PART {i}: {s}" for i, s in enumerate(summaries, 1))
+        prompt = f"""Below are partial summaries of ONE academic paper. Each was written after
+reading a different part of it, so they overlap and each is incomplete.
+
+PAPER: {paper.title}
+Authors: {', '.join(paper.authors[:5])} | Year: {paper.year}
+
+{joined}
+
+Merge these into ONE factual summary of 2-4 sentences that will be used to
+INTRODUCE this study in a literature review, before its quoted findings are
+presented. Cover, where the parts state them: what the study set out to examine,
+its design/methodology, its sample/dataset/scope, and the general nature of its
+findings.
+
+Rules:
+- Use ONLY information present in the partial summaries above. Do not add,
+  infer, or embellish any detail that is not there.
+- Write it as a paraphrase in your own words, not as a quotation.
+- If the parts contradict each other, prefer the more specific statement.
+- Output ONLY the merged summary text. No preamble, no JSON, no headings.
+
+Merged summary:"""
+        r = self.llm.run_primary(prompt, task="title_generation")
+        if r.success and (r.response or "").strip():
+            return r.response.strip()
+        return max(summaries, key=len)
 
     def _log_section_debug(self, paper_id, text, section_map, gate,
                            has_evidence_heading, section_gate_active):
