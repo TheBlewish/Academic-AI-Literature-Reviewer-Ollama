@@ -46,11 +46,86 @@ class RobustJSONParser:
         if result:
             return result
         
-        # Strategy 5: Manual extraction
+        # Strategy 5: Repair mismatched closers (missing '}' before a ']')
+        result = self._try_close_mismatched(text)
+        if result:
+            return result
+        
+        # Strategy 6: Manual extraction
         result = self._try_manual_extraction(text)
         if result:
             return result
         
+        return None
+    
+    def _try_close_mismatched(self, text: str) -> Optional[Dict]:
+        """Repair a very common LLM slip: an object in a list is not closed
+        before the list's ']', e.g.
+
+            {"selections": [
+                {"paper_index": 1, "reasoning": "..."},
+                {"paper_index": 2, "reasoning": "..."
+            ]}
+                            ^ the '}' for the last object is missing
+
+        _balance_structure cannot fix this because it only appends closers at
+        the end of the string. Here we walk the text and, whenever a closing
+        bracket does not match the innermost opener, insert the closers needed
+        to unwind to it. Text inside strings is never touched, and well-formed
+        input comes back unchanged.
+        """
+        start = text.find('{')
+        if start == -1:
+            return None
+        s = text[start:]
+        out = []
+        stack = []
+        in_str = False
+        escape = False
+        changed = False
+        for ch in s:
+            if in_str:
+                out.append(ch)
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                out.append(ch)
+                continue
+            if ch in '{[':
+                stack.append(ch)
+                out.append(ch)
+                continue
+            if ch in '}]':
+                want = '{' if ch == '}' else '['
+                if stack and stack[-1] != want and want in stack:
+                    # Unwind the levels the model forgot to close.
+                    while stack and stack[-1] != want:
+                        opener = stack.pop()
+                        out.append('}' if opener == '{' else ']')
+                        changed = True
+                if stack and stack[-1] == want:
+                    stack.pop()
+                    out.append(ch)
+                else:
+                    # Stray closer with nothing to match — drop it.
+                    changed = True
+                continue
+            out.append(ch)
+        if not changed:
+            return None
+        repaired = self._balance_structure(''.join(out))
+        try:
+            result = json.loads(repaired)
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, ValueError):
+            pass
         return None
     
     def _try_direct_parse(self, text: str) -> Optional[Dict]:
