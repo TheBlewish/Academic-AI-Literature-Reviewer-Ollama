@@ -675,6 +675,9 @@ class PaperDiscoveryEngine:
         self._catalog_lock = threading.Lock()
         self.paper_catalog: Dict[str, PaperMetadata] = {}
         self.doi_index: Dict[str, str] = {}
+        # Normalised-title index: catches preprint/published duplicates that
+        # carry different DOIs and would otherwise both enter the catalog.
+        self.title_index: Dict[str, str] = {}
         self.papers_dir = "Papers"
         os.makedirs(self.papers_dir, exist_ok=True)
 
@@ -754,18 +757,74 @@ class PaperDiscoveryEngine:
                 added += 1
         return added
 
+    # Titles shorter than this are too generic to dedup on safely.
+    TITLE_DEDUP_MIN_CHARS = 25
+
+    @staticmethod
+    def _norm_title_key(title: str) -> str:
+        """Normalised title key used to catch preprint/published duplicates."""
+        return re.sub(r'[^a-z0-9]+', ' ', (title or "").lower()).strip()
+
     def _add_to_catalog(self, paper: PaperMetadata) -> bool:
+        """Add a paper to the catalog, or merge it into an existing record.
+
+        INVARIANT: doi_index and title_index only ever contain ids that are
+        present in paper_catalog. Every dedup decision is made BEFORE any index
+        is written, so a merge can never leave an index entry pointing at a
+        paper that was never stored. (An earlier version wrote the DOI index
+        first and then merged on title, which produced a dangling pointer and a
+        KeyError the next time that DOI was seen.)
+        """
         with self._catalog_lock:
-            if paper.doi:
-                doi_clean = paper.doi.lower().strip()
-                if doi_clean in self.doi_index:
-                    existing = self.paper_catalog[self.doi_index[doi_clean]]
+            if not hasattr(self, "title_index"):
+                self.title_index = {}
+
+            doi_clean = paper.doi.lower().strip() if paper.doi else ""
+            tkey = self._norm_title_key(paper.title)
+            title_dedup_ok = len(tkey) >= self.TITLE_DEDUP_MIN_CHARS
+
+            # ---- 1) DOI dedup -----------------------------------------------
+            if doi_clean and doi_clean in self.doi_index:
+                existing = self.paper_catalog.get(self.doi_index[doi_clean])
+                if existing is not None:
                     self._merge_metadata(existing, paper)
                     return False
-                self.doi_index[doi_clean] = paper.paper_id
+                # Defensive: index entry pointing at nothing. Heal it and carry
+                # on rather than raising.
+                del self.doi_index[doi_clean]
+
             if paper.paper_id in self.paper_catalog:
                 return False
+
+            # ---- 2) Title dedup ---------------------------------------------
+            # The same study routinely appears twice with DIFFERENT DOIs — a
+            # preprint (bioRxiv / Research Square / Authorea) and the published
+            # version, or a journal issuing two DOIs for one item — so DOI
+            # dedup alone lets both into the catalog. Each then costs a separate
+            # acquisition, quick-read and curation call.
+            if title_dedup_ok and tkey in self.title_index:
+                existing = self.paper_catalog.get(self.title_index[tkey])
+                if existing is not None:
+                    self._merge_metadata(existing, paper)
+                    # Prefer the record that actually has a retrievable full
+                    # text; a published version usually beats the preprint.
+                    if (not getattr(existing, "full_text_available", False)
+                            and getattr(paper, "full_text_available", False)):
+                        existing.full_text_content = paper.full_text_content
+                        existing.full_text_available = True
+                    # Point this DOI at the SURVIVING record so any later
+                    # lookup of it resolves to a real paper.
+                    if doi_clean:
+                        self.doi_index[doi_clean] = existing.paper_id
+                    return False
+                del self.title_index[tkey]
+
+            # ---- 3) Store, then index ---------------------------------------
             self.paper_catalog[paper.paper_id] = paper
+            if doi_clean:
+                self.doi_index[doi_clean] = paper.paper_id
+            if title_dedup_ok:
+                self.title_index[tkey] = paper.paper_id
             return True
 
     def _merge_metadata(self, existing: PaperMetadata, new: PaperMetadata):
