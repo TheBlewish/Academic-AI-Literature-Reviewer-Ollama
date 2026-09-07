@@ -65,6 +65,7 @@ import signal
 import logging
 import tempfile
 import hashlib
+import difflib
 import requests
 from typing import TypedDict, Optional, List, Dict, Any, Tuple
 from datetime import datetime
@@ -85,21 +86,6 @@ from academic_config import (
 )
 from paper_discovery import PaperDiscoveryEngine, PaperMetadata
 from llm_manager import LLMManager, request_interrupt, clear_interrupt
-
-# Post-review interactive Q&A. Lives in its own module so the long main()
-# stays readable. Guarded so an older checkout without qa_session.py still
-# starts (it just reports that Q&A is unavailable instead of crashing).
-try:
-    from qa_session import run_qa_session
-    HAS_QA_SESSION = True
-except ImportError:
-    HAS_QA_SESSION = False
-
-    def run_qa_session(pipeline, results):  # type: ignore[misc]
-        print("Q&A mode unavailable: qa_session.py is missing from the "
-              "project folder. Download it from the repository and place "
-              "it next to Academic_Researcher.py.")
-        return "new"
 from research_planner import ResearchPlanner, ResearchPlan, FocusArea
 from study_analyser import StudyAnalyser
 from reference_harvester import ReferenceHarvester
@@ -554,6 +540,11 @@ class ReviewState(TypedDict):
     tangential_mode_active: bool
     tangential_engagement_count: int
     tangential_round_count: int
+    stagnant_round_count: int
+    all_study_summaries: List[Dict]
+    filter_dropped_total: int
+    curation_excluded_total: int
+    executed_queries: List[str]
     tangential_papers_added: int
     tangential_distillations_done: int
     in_tangential_round: bool
@@ -799,12 +790,74 @@ class AcademicReviewPipeline:
             return "sufficient"
         if state.get("discovery_round", 0) >= state.get("max_discovery_rounds", 15):
             return "sufficient"
+
         decision = state.get("last_sufficiency_decision", "sufficient")
+
+        # ---- TERMINATION GUARDS --------------------------------------------
+        # This is the only reachable exit from the tangential loop, so every
+        # cap has to be checked HERE. Each guard below stops the run and moves
+        # to synthesis with whatever evidence exists — a thin review that
+        # finishes beats a perfect one that never does.
+        if decision in ("sparse_direct_evidence", "bad_picks"):
+            stop = self._tangential_stop_reason(state)
+            if stop:
+                print(f"\n  {Fore.YELLOW}{Style.BRIGHT}STOPPING TANGENTIAL SEARCH — "
+                      f"{stop}{Style.RESET_ALL}")
+                print(f"  {Fore.WHITE}Proceeding to synthesis with "
+                      f"{len(state.get('study_summaries') or [])} curated study(ies) "
+                      f"from a catalog of {len(self.discovery.paper_catalog)} papers."
+                      f"{Style.RESET_ALL}")
+                return "sufficient"
+
         if decision == "sparse_direct_evidence":
             return "sparse"
         if decision == "bad_picks":
             return "bad_picks"
         return "sufficient"
+
+    def _tangential_stop_reason(self, state: ReviewState) -> Optional[str]:
+        """Return a human-readable reason to stop searching, or None to continue.
+
+        Checked on every sufficiency decision because the routers that used to
+        own these limits are attached to an unreachable node.
+        """
+        cfg = self.config
+        tang_round = state.get("tangential_round_count", 0)
+        round_cap = int(cfg.get("tangential_round_cap", 8))
+        if tang_round >= round_cap:
+            return (f"reached the tangential round cap ({tang_round}/{round_cap}). "
+                    f"Raise 'tangential_round_cap' for a longer sweep.")
+
+        engagements = state.get("tangential_engagement_count", 0)
+        max_eng = int(cfg.get("tangential_max_engagements", 2))
+        if engagements > max_eng:
+            return (f"reached the tangential engagement limit "
+                    f"({engagements}/{max_eng}).")
+
+        # Stagnation: rounds that add no new papers cannot change any later
+        # decision, so repeating them is pure waste. In the observed failure the
+        # last ten rounds each added zero papers and re-ran identical queries.
+        stagnant = state.get("stagnant_round_count", 0)
+        max_stagnant = int(cfg.get("max_stagnant_rounds", 3))
+        if stagnant >= max_stagnant:
+            return (f"{stagnant} consecutive round(s) found no new papers — "
+                    f"the searches are returning only papers already in the "
+                    f"catalog, so further rounds cannot change the outcome.")
+
+        total_rounds = (state.get("discovery_round", 0)
+                        + state.get("tangential_round_count", 0))
+        hard_cap = int(cfg.get("absolute_round_cap", 40))
+        if total_rounds >= hard_cap:
+            return f"hit the absolute round cap ({total_rounds}/{hard_cap})."
+
+        started = state.get("run_start_time")
+        budget_min = float(cfg.get("search_time_budget_minutes", 0) or 0)
+        if started and budget_min > 0:
+            elapsed = (time.time() - started) / 60.0
+            if elapsed >= budget_min:
+                return (f"exceeded the search time budget "
+                        f"({elapsed:.0f} of {budget_min:.0f} minutes).")
+        return None
 
     def _route_post_tangential_curate(self, state: ReviewState) -> str:
         if state.get("interrupted"):
@@ -980,6 +1033,33 @@ class AcademicReviewPipeline:
             if not query:
                 continue
 
+            # ---- DUPLICATE QUERY SUPPRESSION -------------------------------
+            # The tangential planner regenerates the same phrasing round after
+            # round ("stimulant induced hypertension left ventricular
+            # hypertrophy mechanism" ran eight times in one observed run). The
+            # databases are deterministic, so a repeated query returns papers
+            # already in the catalog and burns a full search + selection call
+            # for nothing. Skip verbatim repeats and let the planner know.
+            qkey = re.sub(r'[^a-z0-9]+', ' ', query.lower()).strip()
+            executed = state.get("executed_queries") or []
+            if qkey and qkey in executed:
+                print(f"\n  {color}P{priority}: {area}{Style.RESET_ALL}")
+                print(f"  {Fore.YELLOW}  {SYM_SEARCH} {query}{Style.RESET_ALL}")
+                print(f"  {Fore.YELLOW}    Already searched this exact query earlier — "
+                      f"skipping (it would return the same papers).{Style.RESET_ALL}")
+                state["search_history"].append({
+                    "round": (f"T{state.get('tangential_round_count', 0) + 1}"
+                              if is_tang else f"R{rnd + 1}"),
+                    "mode": "tangential" if is_tang else "standard",
+                    "query": query, "focus_area": area,
+                    "total_candidates": 0, "selected_count": 0,
+                    "outcome": "skipped_duplicate_query",
+                    "candidate_titles": [], "selected_titles": [],
+                    "selection_reasoning": "Skipped: identical query already run.",
+                })
+                continue
+            state["executed_queries"] = executed + [qkey]
+
             print(f"\n  {color}P{priority}: {area}{Style.RESET_ALL}")
             print(f"  {Fore.BLUE}  {SYM_SEARCH} {query}{Style.RESET_ALL}")
 
@@ -1052,6 +1132,8 @@ class AcademicReviewPipeline:
 
                 if is_tang:
                     state["tangential_papers_added"] = state.get("tangential_papers_added", 0) + added
+                state["_papers_added_this_round"] = \
+                    state.get("_papers_added_this_round", 0) + added
             else:
                 print(f"  {Fore.YELLOW}  LLM found no relevant papers in results.{Style.RESET_ALL}")
 
@@ -1059,6 +1141,21 @@ class AcademicReviewPipeline:
 
         state["focus_areas_completed"] = state.get("focus_areas_completed", []) + \
             [fa.get("area", "?") for fa in focus_areas]
+
+        # ---- STAGNATION TRACKING -------------------------------------------
+        # A round that adds nothing to the catalog cannot change any downstream
+        # decision. Counting these is what lets the run stop instead of
+        # re-running the same searches for hours.
+        added_this_round = state.get("_papers_added_this_round", 0)
+        if added_this_round > 0:
+            state["stagnant_round_count"] = 0
+        else:
+            state["stagnant_round_count"] = state.get("stagnant_round_count", 0) + 1
+            limit = int(self.config.get("max_stagnant_rounds", 3))
+            print(f"  {Fore.YELLOW}No new papers this round "
+                  f"({state['stagnant_round_count']}/{limit} stagnant)."
+                  f"{Style.RESET_ALL}")
+        state["_papers_added_this_round"] = 0
 
         if is_tang:
             state["tangential_round_count"] = state.get("tangential_round_count", 0) + 1
@@ -1078,6 +1175,107 @@ class AcademicReviewPipeline:
                   f"round {state.get('tangential_round_count',0)}/{self.config.get('tangential_round_cap',100)}"
                   f"{Style.RESET_ALL}")
         return state
+
+    # =========================================================================
+    # SELECTION INTEGRITY — deterministic index/title cross-check
+    # =========================================================================
+    # The model is asked to echo each selected paper's title verbatim alongside
+    # its index. The echoed title is then checked against the paper sitting at
+    # that index. This catches the failure mode where a model emits 0-based
+    # indices (or otherwise mis-numbers), which silently substituted the
+    # NEIGHBOURING paper for the one it actually reasoned about and flooded the
+    # catalog with unrelated studies. Nothing here changes WHICH papers the
+    # model may choose — it only guarantees the paper added is the paper meant.
+
+    SELECTION_TITLE_MATCH_MIN = 0.75
+
+    @staticmethod
+    def _norm_title_for_match(t: str) -> str:
+        # Papers are listed to the model as "12. [2019] Title...", so it often
+        # copies the bracketed year into its echo. Strip a leading year marker
+        # before comparing, otherwise short titles can fall under the match
+        # threshold and get dropped for no good reason.
+        t = re.sub(r'^\s*\[?\s*(19|20)\d{2}\s*\]?\s*', '', (t or ""))
+        return re.sub(r'[^a-z0-9]+', ' ', t.lower()).strip()
+
+    @classmethod
+    def _title_similarity(cls, a: str, b: str) -> float:
+        na, nb = cls._norm_title_for_match(a), cls._norm_title_for_match(b)
+        if not na or not nb:
+            return 0.0
+        if na == nb:
+            return 1.0
+        return difflib.SequenceMatcher(None, na, nb).ratio()
+
+    def _resolve_selections(self, selections, papers, reason_key, label):
+        """Map raw LLM selections onto papers, verifying index against title.
+
+        Returns (selected_papers, reasons). Emits a terminal notice for every
+        correction or drop so mis-numbering is visible instead of silent.
+        """
+        selected_papers, reasons = [], []
+        seen_ids = set()
+        corrected = dropped = unverified = 0
+
+        for sel in selections or []:
+            if not isinstance(sel, dict):
+                continue
+            idx = sel.get("paper_index")
+            if isinstance(idx, str) and idx.strip().isdigit():
+                idx = int(idx.strip())
+            reason = sel.get(reason_key, "") or sel.get("reasoning", "") or ""
+            echoed = (sel.get("title") or "").strip()
+
+            by_index = None
+            if isinstance(idx, int) and 1 <= idx <= len(papers):
+                by_index = papers[idx - 1]
+
+            chosen = None
+            if not echoed:
+                # No echo to check against — fall back to the index alone.
+                chosen = by_index
+                if chosen is not None:
+                    unverified += 1
+            else:
+                sim_idx = self._title_similarity(echoed, by_index.title) if by_index else 0.0
+                if sim_idx >= self.SELECTION_TITLE_MATCH_MIN:
+                    chosen = by_index
+                else:
+                    best, best_sim = None, 0.0
+                    for p in papers:
+                        sim = self._title_similarity(echoed, p.title)
+                        if sim > best_sim:
+                            best, best_sim = p, sim
+                    if best is not None and best_sim >= self.SELECTION_TITLE_MATCH_MIN:
+                        chosen = best
+                        corrected += 1
+                        print(f"  {Fore.YELLOW}    ! index {idx} pointed at "
+                              f"\"{(by_index.title if by_index else 'nothing')[:60]}\" but the "
+                              f"model named \"{echoed[:60]}\" — using the named paper."
+                              f"{Style.RESET_ALL}")
+                    else:
+                        dropped += 1
+                        print(f"  {Fore.YELLOW}    ! dropped a selection: index {idx} and "
+                              f"title \"{echoed[:60]}\" do not match any candidate."
+                              f"{Style.RESET_ALL}")
+                        continue
+
+            if chosen is None:
+                dropped += 1
+                continue
+            if chosen.paper_id in seen_ids:
+                continue
+            seen_ids.add(chosen.paper_id)
+            selected_papers.append(chosen)
+            reasons.append(reason)
+
+        if corrected or dropped:
+            print(f"  {Fore.YELLOW}    Selection integrity ({label}): "
+                  f"{corrected} corrected, {dropped} dropped.{Style.RESET_ALL}")
+        if unverified:
+            print(f"  {Fore.YELLOW}    {unverified} selection(s) had no title echo — "
+                  f"accepted on index alone (unverified).{Style.RESET_ALL}")
+        return selected_papers, reasons
 
     def _llm_select_papers(self, query: str, focus_area: str,
                            papers: List[PaperMetadata],
@@ -1134,14 +1332,23 @@ topical proximity.
 
 ================ OUTPUT FORMAT ================
 
+REMINDER — the question every selection must serve is:
+  "{query}"
+
 For EACH paper you INCLUDE, provide a one-or-two-sentence justification of
 how it informs the user's question.
+
+NUMBERING RULE (critical): the papers above are numbered starting at 1. Use
+that exact printed number as "paper_index". Do NOT count from zero. You must
+also copy the paper's title EXACTLY as printed above into "title" — the title
+is cross-checked against the index, and any selection whose title and index
+disagree is discarded.
 
 Respond with ONLY JSON (NO overall_reasoning field — only per-paper reasons):
 {{
     "selections": [
-        {{"paper_index": 1, "reasoning": "specific reason naming what this paper contributes to answering the user's question"}},
-        {{"paper_index": 3, "reasoning": "specific reason naming what this paper contributes to answering the user's question"}}
+        {{"paper_index": 1, "title": "exact title of paper 1, copied verbatim", "reasoning": "specific reason naming what this paper contributes to answering the user's question"}},
+        {{"paper_index": 3, "title": "exact title of paper 3, copied verbatim", "reasoning": "specific reason naming what this paper contributes to answering the user's question"}}
     ]
 }}
 
@@ -1155,14 +1362,8 @@ If genuinely NONE of these papers directly inform the user's question, respond:
         per_paper_reasoning = []
         if result.success and result.json_response:
             selections = result.json_response.get("selections", [])
-            for sel in selections:
-                if not isinstance(sel, dict):
-                    continue
-                idx = sel.get("paper_index")
-                reasoning = sel.get("reasoning", "")
-                if isinstance(idx, int) and 1 <= idx <= len(papers):
-                    selected_papers.append(papers[idx - 1])
-                    per_paper_reasoning.append(reasoning)
+            selected_papers, per_paper_reasoning = self._resolve_selections(
+                selections, papers, reason_key="reasoning", label="standard")
         else:
             error_info = result.error or "Unknown error"
             print(f"  {Fore.RED}  Selection failed: {error_info}{Style.RESET_ALL}")
@@ -1283,11 +1484,20 @@ For EACH paper you INCLUDE, provide an intended use that (a) names the SINGLE
 hop connecting it to the question and (b) states the subject domain it belongs
 to, so the gate is auditable.
 
+REMINDER — the original question every selection must serve is:
+  "{query}"
+
+NUMBERING RULE (critical): the papers above are numbered starting at 1. Use
+that exact printed number as "paper_index". Do NOT count from zero. You must
+also copy the paper's title EXACTLY as printed above into "title" — the title
+is cross-checked against the index, and any selection whose title and index
+disagree is discarded.
+
 Respond with ONLY JSON (NO overall_reasoning field — only per-paper intended uses):
 {{
     "selections": [
-        {{"paper_index": 1, "intended_use": "SINGLE-hop connection + the domain this paper belongs to"}},
-        {{"paper_index": 3, "intended_use": "SINGLE-hop connection + the domain this paper belongs to"}}
+        {{"paper_index": 1, "title": "exact title of paper 1, copied verbatim", "intended_use": "SINGLE-hop connection + the domain this paper belongs to"}},
+        {{"paper_index": 3, "title": "exact title of paper 3, copied verbatim", "intended_use": "SINGLE-hop connection + the domain this paper belongs to"}}
     ]
 }}
 
@@ -1301,14 +1511,8 @@ If no papers pass all three gates:
         per_paper_intended_uses = []
         if result.success and result.json_response:
             selections = result.json_response.get("selections", [])
-            for sel in selections:
-                if not isinstance(sel, dict):
-                    continue
-                idx = sel.get("paper_index")
-                intended_use = sel.get("intended_use", "")
-                if isinstance(idx, int) and 1 <= idx <= len(papers):
-                    selected_papers.append(papers[idx - 1])
-                    per_paper_intended_uses.append(intended_use)
+            selected_papers, per_paper_intended_uses = self._resolve_selections(
+                selections, papers, reason_key="intended_use", label="tangential")
         else:
             error_info = result.error or "Unknown error"
             print(f"  {Fore.RED}  Tangential selection failed: {error_info}{Style.RESET_ALL}")
@@ -1410,6 +1614,22 @@ If no papers pass all three gates:
               f"{int(total_time//60)}m {int(total_time%60)}s{Style.RESET_ALL}")
         state["study_summaries"] = summaries
         state["read_paper_ids"] = [pid for pid in read_ids if pid]
+
+        # ---- APPEND-ONLY EVIDENCE POOL --------------------------------------
+        # study_summaries is the working set and gets replaced downstream by the
+        # relevance filter and curation. This pool is never pruned, so a study
+        # dropped in an early round can still be recovered for synthesis instead
+        # of being lost for the rest of the run.
+        pool = list(state.get("all_study_summaries") or [])
+        seen = {s.get("paper_id") for s in pool}
+        for s in summaries:
+            pid = s.get("paper_id")
+            if pid and pid not in seen:
+                pool.append(s)
+                seen.add(pid)
+        state["all_study_summaries"] = pool
+        print(f"  {Fore.WHITE}Evidence pool: {len(pool)} study summary(ies) "
+              f"retained across all rounds.{Style.RESET_ALL}")
         return state
 
     def node_filter_relevance(self, state: ReviewState) -> ReviewState:
@@ -1481,10 +1701,51 @@ their number. The "drops" array must still use the numeric indices."""
             except (ValueError, TypeError):
                 pass
 
-        kept = [s for i, s in enumerate(summaries, 1) if i not in drop_set]
         reasoning = result.json_response.get("reasoning", "")
         print(f"  {Fore.WHITE}Reasoning: {reasoning}{Style.RESET_ALL}")
+
+        # ---- GUARD 1: never drop a study that already survived curation -----
+        # study_summaries accumulates across rounds, so an over-eager filter
+        # could otherwise discard the hard-won curated evidence base and leave
+        # curation with nothing to do.
+        protected_ids = set(state.get("curated_paper_ids") or [])
+        rescued = []
+        if protected_ids:
+            for i, s in enumerate(summaries, 1):
+                if i in drop_set and s.get("paper_id") in protected_ids:
+                    drop_set.discard(i)
+                    rescued.append(s.get("paper_title", "?"))
+        if rescued:
+            print(f"  {Fore.YELLOW}Protected {len(rescued)} already-curated "
+                  f"study(ies) from being dropped:{Style.RESET_ALL}")
+            for t in rescued:
+                print(f"  {Fore.YELLOW}    ✓ {t[:90]}{Style.RESET_ALL}")
+
+        kept = [s for i, s in enumerate(summaries, 1) if i not in drop_set]
+
+        # ---- GUARD 2: a 100% wipe is treated as a filter malfunction --------
+        # Dropping every single study is almost always a numbering/parsing
+        # error rather than a real judgement, and it strands curation with an
+        # empty set. Keep everything and say so, rather than silently emptying
+        # the evidence base.
+        if summaries and not kept:
+            print(f"  {Fore.RED}Filter marked ALL {len(summaries)} studies as "
+                  f"irrelevant — treating as a filter malfunction and keeping "
+                  f"all of them. Curation will make the real call."
+                  f"{Style.RESET_ALL}")
+            state["study_summaries"] = summaries
+            return state
+
+        dropped_titles = [s.get("paper_title", "?")
+                          for i, s in enumerate(summaries, 1) if i in drop_set]
+        if dropped_titles:
+            print(f"  {Fore.YELLOW}Dropped {len(dropped_titles)}:{Style.RESET_ALL}")
+            for t in dropped_titles:
+                print(f"  {Fore.YELLOW}    ✗ {t[:90]}{Style.RESET_ALL}")
+
         print(f"  {Fore.GREEN}{SYM_CHECK} Kept {len(kept)} relevant studies.{Style.RESET_ALL}")
+        state["filter_dropped_total"] = (state.get("filter_dropped_total", 0)
+                                         + len(dropped_titles))
         state["study_summaries"] = kept
         return state
 
@@ -1628,8 +1889,32 @@ their number. The "drops" array must still use the numeric indices."""
         return state
 
     def _format_search_history_for_distill(self, search_history: List[Dict]) -> str:
-        lines = []
-        for entry in search_history:
+        """Render the search history under a hard size budget.
+
+        The unbounded version emitted EVERY candidate title from EVERY search
+        for the whole run. By round 10 that was ~167,000 tokens fed into a
+        65,536-token window, so Ollama silently discarded the front of the
+        prompt (including the research question) and the sufficiency check was
+        deciding half-blind — which is what kept the loop running.
+
+        Detail is preserved where it is actually used: the most recent rounds
+        keep their full candidate lists (that is what "bad_picks" detection
+        reads), while older rounds collapse to query + counts + what was
+        selected. A final character ceiling drops the oldest entries entirely
+        if the result would still be oversized.
+        """
+        if not search_history:
+            return ""
+
+        full_n = int(self.config.get("search_history_full_detail_entries", 8))
+        max_chars = int(self.config.get("search_history_max_chars", 40000))
+        max_cand = int(self.config.get("search_history_max_candidates_per_entry", 25))
+
+        total_entries = len(search_history)
+        split = max(0, total_entries - full_n)
+        older, recent = search_history[:split], search_history[split:]
+
+        def render_full(entry) -> List[str]:
             rnd = entry.get("round", "?")
             mode = entry.get("mode", "?").upper()
             query = entry.get("query", "?")
@@ -1639,22 +1924,64 @@ their number. The "drops" array must still use the numeric indices."""
             outcome = entry.get("outcome", "?")
             reasoning = entry.get("selection_reasoning", "")
 
-            lines.append(f"\n--- {rnd} [{mode}] | Focus: {area} ---")
-            lines.append(f"Query: \"{query}\"")
-            lines.append(f"Outcome: {outcome} | Candidates: {total} | Selected: {selected}")
-            if total == 0:
-                lines.append("CANDIDATE TITLES: (none returned)")
+            out = [f"\n--- {rnd} [{mode}] | Focus: {area} ---",
+                   f"Query: \"{query}\"",
+                   f"Outcome: {outcome} | Candidates: {total} | Selected: {selected}"]
+            cands = entry.get("candidate_titles", []) or []
+            if total == 0 or not cands:
+                out.append("CANDIDATE TITLES: (none returned)")
             else:
-                lines.append(f"CANDIDATE TITLES:")
-                for c in entry.get("candidate_titles", []):
-                    lines.append(f"  - [{c.get('year') or '?'}] {c.get('title') or '?'}")
+                out.append("CANDIDATE TITLES:")
+                for c in cands[:max_cand]:
+                    out.append(f"  - [{c.get('year') or '?'}] {c.get('title') or '?'}")
+                if len(cands) > max_cand:
+                    out.append(f"  - ...and {len(cands) - max_cand} further candidates")
             if entry.get("selected_titles"):
-                lines.append(f"YOU SELECTED:")
+                out.append("YOU SELECTED:")
                 for s in entry["selected_titles"]:
-                    lines.append(f"  ✓ [{s.get('year') or '?'}] {s.get('title') or '?'}")
+                    out.append(f"  ✓ [{s.get('year') or '?'}] {s.get('title') or '?'}")
             if reasoning:
-                lines.append(f"SELECTION REASONING: {reasoning}")
-        return "\n".join(lines)
+                out.append(f"SELECTION REASONING: {reasoning}")
+            return out
+
+        def render_compact(entry) -> List[str]:
+            rnd = entry.get("round", "?")
+            mode = entry.get("mode", "?").upper()
+            query = entry.get("query", "?")
+            total = entry.get("total_candidates", 0)
+            selected = entry.get("selected_count", 0)
+            outcome = entry.get("outcome", "?")
+            out = [f"\n--- {rnd} [{mode}] | \"{query}\" → "
+                   f"{total} candidates, {selected} selected ({outcome})"]
+            for s in (entry.get("selected_titles") or []):
+                out.append(f"  ✓ [{s.get('year') or '?'}] {s.get('title') or '?'}")
+            return out
+
+        older_blocks = [("\n".join(render_compact(e))) for e in older]
+        recent_blocks = [("\n".join(render_full(e))) for e in recent]
+
+        # Recent detail is the priority; shed the oldest compact blocks until
+        # the whole thing fits the ceiling.
+        omitted = 0
+        while older_blocks and (
+                sum(len(b) for b in older_blocks) + sum(len(b) for b in recent_blocks)
+                > max_chars):
+            older_blocks.pop(0)
+            omitted += 1
+
+        header = []
+        if omitted:
+            header.append(f"({omitted} earlier search(es) omitted for length; "
+                          f"{len(older_blocks)} summarised, {len(recent_blocks)} "
+                          f"shown in full)")
+        elif older_blocks:
+            header.append(f"({len(older_blocks)} earlier search(es) summarised; "
+                          f"{len(recent_blocks)} most recent shown in full)")
+
+        text = "\n".join(header + older_blocks + recent_blocks)
+        if len(text) > max_chars:
+            text = text[-max_chars:]
+        return text
 
     # =========================================================================
     # NODE: REFINE PLAN (standard + tangential variants)
@@ -1735,6 +2062,56 @@ their number. The "drops" array must still use the numeric indices."""
     # NODE: CURATE EVIDENCE
     # =========================================================================
 
+    def _rescue_deadlocked_curation(self, summaries, included_summaries,
+                                    decision_records, label):
+        """Reinstate the strongest candidates when curation excluded ALL of them.
+
+        Excluding every paper is virtually always a mutual-redundancy deadlock
+        (A dropped as "redundant with B" while B is dropped as "redundant with
+        A"), not a real judgement that no candidate is usable. Handing the
+        synthesis an empty evidence base is never the right outcome, so the top
+        candidates are reinstated using the same criteria the curator was asked
+        to apply: methodological quality (reliability score + study-type weight)
+        first, then recency. Mutates included_summaries and decision_records in
+        place; returns the reinstated list.
+        """
+        floor = int(self.config.get("curation_rescue_min_papers", 5))
+        weights = self.config.get("study_type_weights", {}) or {}
+
+        def _strength(s):
+            try:
+                rel = float(s.get("reliability_score") or 0)
+            except (TypeError, ValueError):
+                rel = 0.0
+            stype = str(s.get("study_type") or "").strip().lower()
+            w = float(weights.get(stype, 3))
+            try:
+                yr = int(s.get("paper_year") or 0)
+            except (TypeError, ValueError):
+                yr = 0
+            return (rel + w, yr)
+
+        ranked = sorted(summaries, key=_strength, reverse=True)
+        rescued = ranked[:max(1, min(floor, len(ranked)))]
+        print(f"\n  {Fore.RED}{Style.BRIGHT}{label} excluded ALL "
+              f"{len(summaries)} papers — this is a mutual-redundancy "
+              f"deadlock, not a real verdict.{Style.RESET_ALL}")
+        print(f"  {Fore.YELLOW}Reinstating the {len(rescued)} strongest "
+              f"candidate(s) so the review has an evidence base:{Style.RESET_ALL}")
+        for s in rescued:
+            print(f"  {Fore.YELLOW}    {SYM_INCLUDE} "
+                  f"{(s.get('paper_title') or '?')[:85]} "
+                  f"[{s.get('paper_year','?')}, {s.get('study_type','?')}, "
+                  f"reliability {s.get('reliability_score','?')}/10]{Style.RESET_ALL}")
+            included_summaries.append(s)
+            for rec in decision_records:
+                if rec.get("paper_id") == s.get("paper_id"):
+                    rec["include"] = True
+                    rec["reasoning"] = ("(reinstated — curation deadlocked and "
+                                        "excluded every candidate) " + rec.get("reasoning", ""))
+                    break
+        return rescued
+
     def node_curate_evidence(self, state: ReviewState) -> ReviewState:
         self._print_phase_banner(f"{SYM_FILTER} PHASE 5: CURATION (Selecting Papers for the Review)",
                                   color=Fore.CYAN)
@@ -1748,13 +2125,30 @@ their number. The "drops" array must still use the numeric indices."""
         # gets this so it can still judge REDUNDANCY across the set without
         # receiving every paper's full detail (sending all of them in one call
         # is what exhausted the output budget inside the thinking block).
-        catalog_lines = []
-        for idx, s in enumerate(summaries, 1):
-            apa = apa_in_text(s.get("paper_authors") or [], s.get("paper_year"))
-            catalog_lines.append(
-                f"{idx}. {apa} — {s.get('paper_title','?')} "
-                f"[{s.get('paper_year','?')}, {s.get('study_type','?')}]")
-        catalog_text = "\n".join(catalog_lines)
+        def _render_catalog(decided_by_index):
+            """Catalog of all candidates, annotated with the decision so far.
+
+            Without the annotations the model treats every candidate as still
+            in play, which lets it exclude A as redundant with B and then
+            exclude B as redundant with A — a mutual-redundancy deadlock that
+            can empty the entire evidence base.
+            """
+            lines = []
+            for idx, s in enumerate(summaries, 1):
+                apa = apa_in_text(s.get("paper_authors") or [], s.get("paper_year"))
+                status = decided_by_index.get(idx)
+                if status is True:
+                    tag = "[ALREADY INCLUDED]"
+                elif status is False:
+                    tag = "[ALREADY EXCLUDED — cannot make anything redundant]"
+                else:
+                    tag = "[not yet decided]"
+                lines.append(
+                    f"{idx}. {tag} {apa} — {s.get('paper_title','?')} "
+                    f"[{s.get('paper_year','?')}, {s.get('study_type','?')}]")
+            return "\n".join(lines)
+
+        decided_by_index = {}
 
         # Prior decisions (by paper_id) from the last curation pass, for
         # consistency across passes (the model may still revise).
@@ -1830,9 +2224,14 @@ Decide INCLUDE or EXCLUDE for THE PAPER UNDER REVIEW based on:
    well-designed RCTs and large cohort studies, and direct outcome
    measurements over case reports, opinion pieces, or methodologically-limited
    work.
-4. REDUNDANCY — if other candidate papers (listed below) cover the same ground
-   as well or better, EXCLUDE this one as redundant; keep only the strongest,
-   most recent representative of a given finding.
+4. REDUNDANCY — you may EXCLUDE this paper as redundant ONLY IF a paper marked
+   [ALREADY INCLUDED] below covers the same ground as well or better.
+   You must NOT exclude it as redundant against a paper marked
+   [not yet decided] or [ALREADY EXCLUDED]. If nothing has been included yet
+   that covers this ground, then THIS paper is the strongest representative so
+   far and redundancy is not a valid reason to drop it — judge it on relevance,
+   recency and quality alone. Excluding every candidate as "redundant with each
+   other" leaves the review with no evidence at all, which is always wrong.
 5. OVERALL FIT — would a strong literature review actually cite THIS paper? If
    you would skip it as a reviewer, EXCLUDE it.
 
@@ -1848,8 +2247,10 @@ Relevance (per quick-read): {s.get('relevance_to_question','?')}{prior_hint}
 
 ================ OTHER CANDIDATE PAPERS (context for redundancy only) ================
 (You are NOT deciding on these now. They are listed so you can judge whether the
-paper above is redundant. The paper above appears as #{i} in this list.)
-{catalog_text}
+paper above is redundant. The paper above appears as #{i} in this list. Each
+entry shows the decision made so far — only [ALREADY INCLUDED] papers can make
+this one redundant.)
+{_render_catalog(decided_by_index)}
 
 ================ OUTPUT FORMAT ================
 
@@ -1872,6 +2273,8 @@ Respond with ONLY JSON:
                 include = True
                 reasoning = "(curation call failed — kept by default)"
 
+            decided_by_index[i] = include
+
             if include:
                 included_count += 1
                 included_summaries.append(s)
@@ -1891,6 +2294,19 @@ Respond with ONLY JSON:
                 "reasoning": reasoning,
             })
 
+        # ---- DEADLOCK RESCUE ------------------------------------------------
+        # Curating every paper out leaves nothing to write a review from, and it
+        # is virtually always a mutual-redundancy deadlock rather than a real
+        # judgement that no candidate is usable. Rather than proceed with an
+        # empty evidence base, reinstate the strongest candidates by the same
+        # criteria the curator was asked to apply: methodological quality
+        # (reliability score and study type) first, then recency.
+        if summaries and not included_summaries:
+            self._rescue_deadlocked_curation(summaries, included_summaries,
+                                             decision_records, "Curation")
+            included_count = len(included_summaries)
+            excluded_count = len(summaries) - included_count
+
         total_time = time.time() - start_time
         print(f"\n  {Fore.GREEN}{Style.BRIGHT}Curation complete: "
               f"{included_count} included, {excluded_count} excluded "
@@ -1898,6 +2314,8 @@ Respond with ONLY JSON:
 
         summary_assessment = (f"{included_count} included, {excluded_count} excluded "
                               f"(sequential per-study curation).")
+        state["curation_excluded_total"] = (state.get("curation_excluded_total", 0)
+                                            + excluded_count)
 
         state["curated_paper_ids"] = [s.get("paper_id") for s in included_summaries]
         state["study_summaries"] = included_summaries
@@ -2078,6 +2496,15 @@ number. The "paper_index" field must still carry the numeric index."""
                 "reasoning": reasoning,
             })
 
+        # Same deadlock guard as standard curation — tangential mode is where a
+        # long run spends most of its time, and an empty result there strands
+        # the pipeline just as badly.
+        if summaries and not included_summaries:
+            self._rescue_deadlocked_curation(summaries, included_summaries,
+                                             decision_records, "Tangential curation")
+            included_count = len(included_summaries)
+            excluded_count = len(summaries) - included_count
+
         print(f"\n  {Fore.MAGENTA}{Style.BRIGHT}Tangential curation complete: "
               f"{included_count} included, {excluded_count} excluded{Style.RESET_ALL}")
         if summary_assessment:
@@ -2099,6 +2526,80 @@ number. The "paper_index" field must still carry the numeric index."""
     # =========================================================================
     # NODE: EVIDENCE SUFFICIENCY
     # =========================================================================
+
+    def _direct_evidence_inventory(self, state: ReviewState) -> Dict[str, int]:
+        """Count the direct evidence the pipeline is holding but not using.
+
+        The sufficiency check only ever saw the post-curation working set, which
+        the relevance filter and curation shrink every round. A curated set of
+        one looks exactly like a sparse literature even when the catalog holds
+        a hundred usable full texts — which is how a question as heavily
+        researched as creatine and kidney function ended up in tangential mode.
+        """
+        try:
+            papers = self.discovery.get_all_papers()
+        except Exception:
+            papers = []
+        read_ids = set(state.get("read_paper_ids") or [])
+        curated_ids = set(state.get("curated_paper_ids") or [])
+        pool = state.get("all_study_summaries") or []
+
+        full_text = [p for p in papers if getattr(p, "full_text_available", False)]
+        unread_full_text = [p for p in full_text if p.paper_id not in read_ids]
+        pool_unused = [s for s in pool if s.get("paper_id") not in curated_ids]
+
+        return {
+            "catalog": len(papers),
+            "full_text": len(full_text),
+            "unread_full_text": len(unread_full_text),
+            "pool": len(pool),
+            "pool_unused": len(pool_unused),
+            "curated": len(state.get("study_summaries") or []),
+            "filter_dropped": int(state.get("filter_dropped_total", 0)),
+            "curation_excluded": int(state.get("curation_excluded_total", 0)),
+            "standard_rounds": int(state.get("discovery_round", 0)),
+        }
+
+    def _tangential_entry_block(self, state: ReviewState):
+        """Return a reason to REFUSE tangential mode, or None to allow it.
+
+        Tangential mode exists for genuinely under-studied questions. It must
+        not be reachable while the pipeline is still sitting on unexamined
+        direct evidence — that is a curation problem, not a literature problem,
+        and the fix is another standard round with better queries.
+        """
+        cfg = self.config
+        inv = self._direct_evidence_inventory(state)
+
+        # Already holding a healthy set of DIRECT studies: the literature is
+        # plainly not sparse, so write the review rather than chasing proxies.
+        healthy = int(cfg.get("tangential_block_min_curated", 8))
+        if inv["curated"] >= healthy:
+            return ("sufficient",
+                    f"{inv['curated']} direct study(ies) are already curated "
+                    f"(>= {healthy}) — that is not a sparse literature", inv)
+
+        min_rounds = int(cfg.get("min_standard_rounds_before_tangential", 3))
+        if inv["standard_rounds"] < min_rounds:
+            return ("bad_picks",
+                    f"only {inv['standard_rounds']} standard search round(s) "
+                    f"completed (minimum {min_rounds} before indirect evidence "
+                    f"is considered)", inv)
+
+        unread_cap = int(cfg.get("tangential_block_unread_full_text", 10))
+        if inv["unread_full_text"] >= unread_cap:
+            return ("bad_picks",
+                    f"{inv['unread_full_text']} paper(s) with full text have not "
+                    f"been read yet — direct evidence is still available", inv)
+
+        pool_cap = int(cfg.get("tangential_block_unused_pool", 10))
+        if inv["pool_unused"] >= pool_cap:
+            return ("bad_picks",
+                    f"{inv['pool_unused']} already-read study(ies) were discarded "
+                    f"by the filter or curation and never used — the literature "
+                    f"is not sparse, the selection was", inv)
+
+        return None, None, inv
 
     def node_evidence_sufficiency(self, state: ReviewState) -> ReviewState:
         self._print_phase_banner("PHASE 6: EVIDENCE SUFFICIENCY CHECK", color=Fore.MAGENTA)
@@ -2122,6 +2623,16 @@ number. The "paper_index" field must still carry the numeric index."""
                 f"     Relevance: {relevance}")
         evidence_text = "\n".join(evidence_summary_lines)
 
+        inv = self._direct_evidence_inventory(state)
+        inventory_text = (
+            f"Papers in catalog: {inv['catalog']}\n"
+            f"Papers with full text retrieved: {inv['full_text']}\n"
+            f"Full-text papers NOT yet read: {inv['unread_full_text']}\n"
+            f"Studies read across the whole run: {inv['pool']}\n"
+            f"Read studies discarded by the relevance filter: {inv['filter_dropped']}\n"
+            f"Read studies excluded during curation: {inv['curation_excluded']}\n"
+            f"Standard search rounds completed: {inv['standard_rounds']}")
+
         history_text = self._format_search_history_for_distill(state.get("search_history", []))
         memo = state.get("strategy_memo", "")
         memo_block = ""
@@ -2141,6 +2652,14 @@ COMPLETE SEARCH HISTORY:
 CURATED EVIDENCE BASE (post-curation):
 {evidence_text}
 
+WHAT THE PIPELINE IS ACTUALLY HOLDING:
+{inventory_text}
+
+Read those numbers before you decide. The curated set above is what survived
+filtering and curation — it is NOT a measure of how much literature exists. If
+the catalog holds many papers and many were read then discarded, the shortfall
+is in this system's selection, not in the field.
+
 ================ DECISION ================
 
 Choose ONE:
@@ -2157,8 +2676,19 @@ C — "sparse_direct_evidence": you have searched comprehensively. The topic
    gather indirect evidence (class-level, mechanistic, adjacent populations,
    proxy outcomes).
 
-Pick "sparse_direct_evidence" only if you can honestly justify that direct
-evidence does not exist — not just that your searches missed it.
+Pick "sparse_direct_evidence" ONLY if the literature itself is thin. Before
+choosing it, confirm all of the following:
+  - the search history shows you tried the obvious direct terminology for this
+    exact question, not just adjacent phrasings;
+  - the candidate titles returned across rounds genuinely do not contain
+    directly relevant studies;
+  - few papers were read and discarded (a large "discarded" count means the
+    studies existed and were thrown away — that is "bad_picks", not sparse).
+
+A small curated set on a well-studied topic is almost always "bad_picks".
+Well-researched questions — common supplements, licensed medications, standard
+clinical interventions — have direct literature; if you found none, your
+queries or your selection were wrong, not the field.
 
 ================ OUTPUT ================
 
@@ -2177,6 +2707,34 @@ shown for each study, e.g. (Smith et al., 2020), or narratively as Smith et al.
 
         result = self.agent_manager.run_primary(
             prompt, as_json=True, task="evidence_sufficiency")
+
+        # ---- TANGENTIAL ENTRY GATE (deterministic) --------------------------
+        # Whatever the model decides, tangential mode stays locked while direct
+        # evidence is demonstrably unexploited. Downgrading to "bad_picks" sends
+        # the run back for another STANDARD round with refined queries, which is
+        # the correct response to a selection failure.
+        if result.success and result.json_response:
+            if result.json_response.get("decision") == "sparse_direct_evidence":
+                action, block, inv = self._tangential_entry_block(state)
+                if action:
+                    print(f"\n  {Fore.YELLOW}{Style.BRIGHT}TANGENTIAL MODE REFUSED"
+                          f"{Style.RESET_ALL}")
+                    print(f"  {Fore.YELLOW}The model judged the literature sparse, "
+                          f"but {block}.{Style.RESET_ALL}")
+                    print(f"  {Fore.WHITE}Catalog {inv['catalog']} | full text "
+                          f"{inv['full_text']} | read {inv['pool']} | "
+                          f"filter dropped {inv['filter_dropped']} | curation "
+                          f"excluded {inv['curation_excluded']}{Style.RESET_ALL}")
+                    if action == "sufficient":
+                        print(f"  {Fore.WHITE}Enough direct evidence is in hand — "
+                              f"proceeding to synthesis.{Style.RESET_ALL}")
+                    else:
+                        print(f"  {Fore.WHITE}Treating this as a selection problem "
+                              f"and running another standard round.{Style.RESET_ALL}")
+                    result.json_response["decision"] = action
+                    result.json_response["reasoning"] = (
+                        f"[Overridden by the tangential entry gate: {block}.] "
+                        + str(result.json_response.get("reasoning", "")))
 
         if not result.success or not result.json_response:
             print(f"  {Fore.RED}Sufficiency check failed — defaulting to 'sufficient'.{Style.RESET_ALL}")
@@ -2235,6 +2793,51 @@ shown for each study, e.g. (Smith et al., 2020), or narratively as Smith et al.
         summaries = state.get("study_summaries", [])
         all_papers_map = {p.paper_id: p for p in self.discovery.get_all_papers()}
         min_verified = self.config.get("min_verified_quotes_per_study", 1)
+
+        # ---- EVIDENCE TOP-UP -------------------------------------------------
+        # Quotes can only be verified against text the system actually holds, so
+        # a curated set of abstract-only papers yields an empty review. Refill
+        # from the append-only pool, full-text papers first.
+        target = int(self.config.get("min_studies_for_deep_analysis", 8))
+        pool = state.get("all_study_summaries") or []
+        if pool and len(summaries) < target:
+            have = {s.get("paper_id") for s in summaries}
+            weights = self.config.get("study_type_weights", {}) or {}
+
+            def _pool_rank(s):
+                paper = all_papers_map.get(s.get("paper_id"))
+                has_text = 1 if (paper is not None and
+                                 getattr(paper, "full_text_available", False)) else 0
+                try:
+                    rel = float(s.get("reliability_score") or 0)
+                except (TypeError, ValueError):
+                    rel = 0.0
+                w = float(weights.get(str(s.get("study_type") or "").strip().lower(), 3))
+                try:
+                    yr = int(s.get("paper_year") or 0)
+                except (TypeError, ValueError):
+                    yr = 0
+                return (has_text, rel + w, yr)
+
+            extras = sorted((s for s in pool if s.get("paper_id") not in have),
+                            key=_pool_rank, reverse=True)[:target - len(summaries)]
+            if extras:
+                with_text = sum(1 for s in extras
+                                if getattr(all_papers_map.get(s.get("paper_id")),
+                                           "full_text_available", False))
+                print(f"  {Fore.YELLOW}Only {len(summaries)} curated study(ies) — "
+                      f"topping up from the {len(pool)}-study evidence pool."
+                      f"{Style.RESET_ALL}")
+                print(f"  {Fore.YELLOW}Added {len(extras)} study(ies) "
+                      f"({with_text} with full text):{Style.RESET_ALL}")
+                for s in extras:
+                    ft = ("full text" if getattr(
+                        all_papers_map.get(s.get("paper_id")),
+                        "full_text_available", False) else "abstract only")
+                    print(f"  {Fore.YELLOW}    + {(s.get('paper_title') or '?')[:78]} "
+                          f"[{s.get('paper_year','?')}, {ft}]{Style.RESET_ALL}")
+                summaries = list(summaries) + extras
+                state["study_summaries"] = summaries
 
         print(f"  {Fore.WHITE}Deep-analyzing {len(summaries)} curated studies.{Style.RESET_ALL}")
 
@@ -4132,7 +4735,7 @@ OUTPUT ONLY THE REVISED REVIEW — no preamble or markdown fences."""
     # ---------- Verification convergence helpers ----------
 
     def _super_critical_quote_rules(self) -> str:
-        """The strongest possible framing (per James's spec): hand-typing any
+        """The strongest possible framing: hand-typing any
         quotation, or copying evidence-base display text, is a SUPER-CRITICAL,
         review-breaking error that blocks the review from passing."""
         return (
@@ -6052,6 +6655,12 @@ Respond with ONLY the title text."""
                 "tangential_mode_active": False,
                 "tangential_engagement_count": 0,
                 "tangential_round_count": 0,
+                "stagnant_round_count": 0,
+                "all_study_summaries": [],
+                "filter_dropped_total": 0,
+                "curation_excluded_total": 0,
+                "executed_queries": [],
+                "_papers_added_this_round": 0,
                 "tangential_papers_added": 0,
                 "tangential_distillations_done": 0,
                 "in_tangential_round": False,
@@ -6081,12 +6690,7 @@ Respond with ONLY the title text."""
                       "papers_found": len(self.discovery.paper_catalog),
                       "papers_with_full_text": len(self.discovery.get_full_text_papers()),
                       "studies_analyzed": len(final.get("study_analyses", [])),
-                      "elapsed_time": elapsed,
-                      # The complete final graph state, so post-review Q&A can
-                      # ground its answers in the actual analysed studies and
-                      # quote registry instead of a truncated slice of prose.
-                      # Additive only — every pre-existing key is unchanged.
-                      "state": final}
+                      "elapsed_time": elapsed}
         finally:
             # Always close + name the log, even if the run errored or was
             # interrupted, so partial runs are still captured for debugging.
@@ -6218,21 +6822,21 @@ def main():
             # (default) it behaves exactly as before.
             qa_enabled = bool(pipeline.config.get("qa_mode_enabled", True))
             if results.get("review") and qa_enabled:
-                # The Q&A session now lives in qa_session.run_qa_session().
-                # It returns "quit" (leave the program) or "new" (ask another
-                # research question). See qa_session.py for the full list of
-                # bugs this replaces — chiefly the stale interrupt flag that
-                # silently disabled every answer after a single Ctrl-C, and the
-                # missing else-branch that swallowed every error.
-                if run_qa_session(pipeline, results) == "quit":
+                print(f"\n{Fore.CYAN}Q&A mode ('new'/'quit'){Style.RESET_ALL}")
+                while True:
+                    fu = input(f"{Fore.GREEN}Q&A> {Style.RESET_ALL}").strip()
+                    if not fu or fu.lower() in ('new', 'quit', 'exit', 'q'):
+                        break
+                    r = pipeline.agent_manager.run_primary(
+                        f'Answer from this review: "{fu}"\n\n{results["review"][:10000]}',
+                        task="qa_mode")
+                    if r.success:
+                        print(f"\n{Fore.WHITE}{r.response}{Style.RESET_ALL}")
+                if fu and fu.lower() in ('quit', 'exit', 'q'):
                     break
             elif results.get("review") and not qa_enabled:
                 print(f"\n{Fore.WHITE}Q&A mode is disabled in config — review complete. "
                       f"Enter another question or 'quit'.{Style.RESET_ALL}")
-            elif not results.get("review"):
-                print(f"\n{Fore.YELLOW}No review was produced this run, so there "
-                      f"is nothing for Q&A to answer from. Check the session log "
-                      f"in the Logs folder for what went wrong.{Style.RESET_ALL}")
         except EOFError:
             break
         except KeyboardInterrupt:
