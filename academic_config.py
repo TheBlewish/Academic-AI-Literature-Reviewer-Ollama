@@ -18,11 +18,13 @@ import os
 
 PRIMARY_LLM_CONFIG = {
     "llm_type": "ollama",
-    # NOTE: default is the local Ollama on THIS machine. If you run the program
-    # on one box and Ollama on another, put that machine's address here
-    # instead, e.g. "http://192.168.1.50:11434" or a Tailscale hostname.
-    "base_url": "http://localhost:11434",
-    "model_name": "qwen3.5:35b",
+    # Ollama endpoint. Override with the OLLAMA_BASE_URL env var if Ollama
+    # runs on another machine, e.g. http://192.168.1.50:11434
+    "base_url": os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+    # Any instruction-following Ollama model. Larger is markedly better at
+    # the paper-selection and curation stages. Override with the
+    # ACADEMIC_LLM_MODEL env var, or edit this line.
+    "model_name": os.environ.get("ACADEMIC_LLM_MODEL", "qwen3.5:35b"),
     "temperature": 0.1,
     "top_p": 0.9,
     "n_ctx": 65536,
@@ -80,76 +82,42 @@ THINKING_CONFIG = {
 # therefore reviews a focused corpus rather than a 200-paper sweep. Raise these
 # caps if your small device has more headroom.
 LOW_END_CONFIG = {
-    # MASTER TOGGLE — simple yes/no. "no" = full behaviour, unchanged, for the
-    # big machine (Strix Halo / 128GB). "yes" = chunked low-end mode for a small
-    # device. THIS IS THE ONLY LINE YOU CHANGE TO SWITCH BETWEEN MACHINES.
-    #
-    # Currently: "no" — FULL MODE. Nothing else in this dict is read, and
-    # PRIMARY_LLM_CONFIG below takes over completely: full context window, the
-    # full corpus, and unchunked deep analysis (the whole paper in one call).
-    #
-    # Set to "yes" for a small machine (tested on a GMKtec NucBox M6 Ultra:
-    # Ryzen 5 7640HS, Radeon 760M iGPU, 16GB RAM). That switches on chunked
-    # deep analysis and the reduced budgets below.
+    # MASTER TOGGLE — simple yes/no. "no" (default) = full behaviour, unchanged,
+    # for the big machine. "yes" = chunked low-end mode for a small device.
     "low_end_device_mode": "no",
 
     # Context window of the small device's model. Every call is capped here and
     # the chunk budgets below keep each call's input comfortably under it.
-    # 8192 is right for a 9B model on 11.5GB usable RAM. Raise to 16384 only if
-    # you free up memory; the chunk sizes below still fit a 16K window.
+    # Set to 8192 for the GMKtec NucBox M6 Ultra (Ryzen 5 7640HS / 16GB), which
+    # runs a ~14B model at low quant fast at 8K. Raise to 16384 if your small
+    # device has more headroom — the chunk sizes below still fit a 16K window.
     "n_ctx": 8192,
 
-    # Endpoint / model overrides for the small device. Leave BLANK ("") to keep
-    # the PRIMARY_LLM_CONFIG values. Filled here so the NucBox talks to its OWN
-    # local Ollama instead of the Strix Halo box over Tailscale.
-    "base_url": "http://localhost:11434",
-    "model_name": "qwen3.5:9b",
+    # OPTIONAL endpoint / model overrides for the small device. Leave BLANK ("")
+    # to keep the PRIMARY_LLM_CONFIG values (e.g. if the same Ollama endpoint
+    # serves the small model). Fill these if the small device differs.
+    "base_url": "",
+    "model_name": "",
 
-    # ---- Chunk budgets (characters; ~3.6 chars/token) ----
+    # ---- Chunk budgets (characters; ~3 chars/token) ----
     # deep_analysis: sequential paper chunk size + overlap between chunks.
-    #
-    # BUDGET ARITHMETIC for the 8192 window (deep_analysis_low_end profile):
-    #     prompt scaffolding (measured)      ~1,140 tok
-    #     paper chunk  10,000 chars / 3.6    ~2,780 tok
-    #     output budget (max_tokens)          2,048 tok
-    #     safety headroom                      ~400 tok
-    #                                        -----------
-    #     total                              ~6,370 tok  of 8,192  -> fits
-    #
-    # 10,000 (rather than the old 6,000) is deliberate: it nearly halves the
-    # number of LLM calls per paper, which is the single biggest driver of run
-    # time on a mini PC, while still leaving ~1,800 tokens of slack.
-    #
-    # The 600-char overlap keeps a sentence that straddles a chunk boundary
-    # recoverable whole in the following chunk — important because a half
-    # sentence can never pass verbatim verification.
-    "deep_analysis_chunk_chars": 10000,
-    "deep_analysis_chunk_overlap": 600,
-
-    # Hard ceiling on LLM calls spent reading ONE paper. 4 chunks x 9,400 net
-    # chars covers ~37,600 characters (roughly 15 pages) — the whole of a typical
-    # journal article's body. Papers longer than that lose their tail, which is
-    # usually references and appendices. 0 = unlimited (slow; not advised here).
-    "max_chunks_per_paper": 4,
-
-    # Spend one extra SMALL call per paper merging the per-chunk study summaries
-    # into the single 2-4 sentence paraphrase synthesis uses to introduce the
-    # study. Set False to skip the call and use the longest chunk summary
-    # instead — saves ~1 call per paper at some cost to that intro's quality.
-    "merge_study_summary": True,
-
-    # Cap on how much of a paper is read at all. The full-mode default is 50,000
-    # chars; with 4 chunks of 10,000 there is no point loading more than the
-    # chunker will reach. Verification still runs against the COMPLETE text.
-    "max_study_text_length": 40000,
+    # Sized for an 8K window: ~6000 chars (~2000 tok) + prompt scaffolding
+    # (~470 tok) + the 2048-tok output budget + safety/headroom all fit under
+    # 8192 with room to spare (computed need ~7200 tok). A 500-char overlap
+    # keeps sentences that straddle a chunk boundary recoverable in one chunk.
+    # If you raise n_ctx above to 16384 you may raise this to 9000 to read each
+    # paper in fewer passes.
+    "deep_analysis_chunk_chars": 6000,
+    "deep_analysis_chunk_overlap": 500,
+    # synthesis MAP: max evidence characters per study-batch.
+    "synthesis_map_batch_chars": 6000,
+    # synthesis REDUCE: max combined draft characters per assembly group; if the
+    # batch drafts exceed this they are merged hierarchically in groups first.
+    "synthesis_reduce_group_chars": 7000,
 
     # ---- Corpus caps so discovery-stage holistic calls fit the small window ----
-    # Tuned DOWN from the original 60/3 so a run on the NucBox finishes in hours
-    # rather than a day. See SETUP_NUCBOX.md for the demo-speed preset.
-    "max_total_papers": 25,
+    "max_total_papers": 60,
     "target_papers_per_focus_area": 3,
-    "max_discovery_rounds": 5,
-    "num_focus_areas": 4,
 }
 
 # =============================================================================
@@ -175,7 +143,11 @@ TASK_PROFILES = {
     },
     "paper_selection": {
         "num_ctx": 32768,
-        "max_tokens": 1024,
+        # Raised 1024 -> 2560. Each selection now also echoes the paper's title
+        # (used to cross-check the index server-side), which costs roughly 25
+        # extra tokens per pick. A round that selects 15-19 papers would have
+        # been truncated mid-JSON at 1024, losing the tail of the selection.
+        "max_tokens": 2560,
         "think": False,
     },
 
@@ -352,7 +324,7 @@ SEARCH_APIS = {
     "openalex": {
         "enabled": True,
         "base_url": "https://api.openalex.org",
-        "email": os.environ.get("OPENALEX_EMAIL", "shadefrog@duck.com"),
+        "email": os.environ.get("OPENALEX_EMAIL", "academic.researcher@example.com"),
         "results_per_page": 25,
         "max_pages": 3,
         "rate_limit_delay": 0.2,
@@ -368,7 +340,7 @@ SEARCH_APIS = {
     "unpaywall": {
         "enabled": True,
         "base_url": "https://api.unpaywall.org/v2",
-        "email": os.environ.get("UNPAYWALL_EMAIL", "shadefrog@duck.com"),
+        "email": os.environ.get("UNPAYWALL_EMAIL", "academic.researcher@example.com"),
         "rate_limit_delay": 0.1,
     },
     "europe_pmc": {
@@ -381,7 +353,7 @@ SEARCH_APIS = {
     "crossref": {
         "enabled": True,
         "base_url": "https://api.crossref.org",
-        "email": os.environ.get("CROSSREF_EMAIL", "shadefrog@duck.com"),
+        "email": os.environ.get("CROSSREF_EMAIL", "academic.researcher@example.com"),
         "results_per_page": 20,
         "max_pages": 2,
         "rate_limit_delay": 0.15,
@@ -406,6 +378,23 @@ RESEARCH_CONFIG = {
     "target_papers_per_focus_area": 5,
     "max_total_papers": 200,
     "dedup_by_doi": True,
+    # Also merge papers whose normalised TITLES match even when their DOIs
+    # differ — preprint (bioRxiv/Research Square/Authorea) and published
+    # versions of the same study otherwise both enter the catalog and each
+    # costs a separate acquisition, quick-read and curation call.
+    "dedup_by_title": True,
+
+    # ---- SEARCH-HISTORY RENDERING BUDGET --------------------------------
+    # The strategy-distillation and evidence-sufficiency prompts both include
+    # the search history. Rendered without a bound it grew to ~167,000 tokens
+    # by round 10 — far past any model window — so the model silently received
+    # a truncated prompt with the research question chopped off the front.
+    # These three keys bound it. Detail is kept where it is used: the most
+    # recent rounds keep full candidate lists (that is what "bad_picks"
+    # detection reads); older rounds collapse to query + counts + selections.
+    "search_history_full_detail_entries": 8,
+    "search_history_max_candidates_per_entry": 25,
+    "search_history_max_chars": 40000,
     "papers_directory": "Papers",
     "max_pdf_download_retries": 3,
     "pdf_download_timeout": 30,
@@ -480,16 +469,82 @@ RESEARCH_CONFIG = {
     # Curation runs every N search rounds OR when readiness check says ready.
     "curate_every_n_rounds": 5,
 
+    # If sequential curation excludes EVERY candidate, that is a mutual-
+    # redundancy deadlock (paper A dropped as "redundant with B" while B is
+    # dropped as "redundant with A"), not a real verdict that nothing is
+    # usable. Rather than hand the synthesis an empty evidence base, the
+    # strongest N candidates are reinstated, ranked by reliability score plus
+    # study-type weight, then recency.
+    "curation_rescue_min_papers": 5,
+
+    # ---- RUN TERMINATION GUARDS -----------------------------------------
+    # A round that adds no new papers to the catalog cannot change any later
+    # decision. After this many consecutive empty rounds the run stops
+    # searching and proceeds to synthesis. In the observed failure the last ten
+    # rounds each added zero papers while re-running identical queries.
+    "max_stagnant_rounds": 3,
+    # If curation leaves fewer than this many studies, deep analysis tops up
+    # from the append-only evidence pool (full-text papers first). Without it a
+    # run that read 322 papers reached synthesis with ONE abstract-only study
+    # and produced a 9-word review.
+    "min_studies_for_deep_analysis": 8,
+    # Budget for the post-deep-review improvement loop (gap fill / extra
+    # rounds). The code default of 35 minutes was measured from run start, so a
+    # long search phase meant the gate was already expired on arrival and could
+    # never act. Total run time is bounded by search_time_budget_minutes plus
+    # this.
+    "post_review_max_minutes": 45,
+    # Absolute ceiling on discovery + tangential rounds combined, whatever else
+    # the routing decides. A backstop, not a target.
+    "absolute_round_cap": 40,
+    # Wall-clock budget for the search phases, in minutes. 0 disables it.
+    "search_time_budget_minutes": 90,
+
     # Tangential mode thresholds (PER ENGAGEMENT)
     "tangential_paper_target": 75,
-    "tangential_round_cap": 100,
+    # Rounds of tangential searching allowed per engagement. This is a SAFETY
+    # cap, not a target — the loop normally exits when the sufficiency check
+    # says "sufficient". It was 100, which in practice meant a run could spend
+    # hours collecting hundreds of papers that curation then rejected. Raise it
+    # if you deliberately want an exhaustive overnight sweep.
+    "tangential_round_cap": 8,
+    # How many times tangential mode may be re-engaged after curation comes up
+    # short. Previously unbounded in practice.
+    "tangential_max_engagements": 2,
     "tangential_curate_every_n_rounds": 5,
     "tangential_min_curated_papers": 15,
 
+    # ---- TANGENTIAL ENTRY GATE ------------------------------------------
+    # Tangential (indirect evidence) mode is for genuinely under-studied
+    # questions. It must stay locked while direct evidence is still sitting
+    # unexamined, otherwise a curation failure gets mistaken for a sparse
+    # literature — which is how a question as heavily researched as creatine
+    # and renal function ended up chasing sympathomimetic pharmacology.
+    # Standard rounds required before indirect evidence may be considered:
+    # A run already holding this many curated DIRECT studies can never call the
+    # literature sparse — it writes the review instead.
+    "tangential_block_min_curated": 8,
+    "min_standard_rounds_before_tangential": 3,
+    # Refuse tangential while at least this many retrieved full texts are unread:
+    "tangential_block_unread_full_text": 10,
+    # Refuse tangential while at least this many already-read studies were
+    # discarded by the filter or curation and never used:
+    "tangential_block_unused_pool": 10,
+
+    # Used to rank papers when curation deadlocks (curation_rescue_min_papers).
+    # IMPORTANT: these keys must match the study_type strings the quick-read
+    # stage actually emits — it writes "rct", "cross_sectional" and
+    # "case_control", not the longer clinical names — so both spellings are
+    # listed. A type missing here falls back to a weight of 3, which would rank
+    # a real RCT level with a narrative review.
     "study_type_weights": {
         "systematic_review": 10, "meta_analysis": 10,
-        "randomized_controlled_trial": 8, "cohort_study": 6,
-        "case_control_study": 5, "cross_sectional_study": 4,
+        "rct": 8, "randomized_controlled_trial": 8, "cohort_study": 6,
+        "case_control": 5, "case_control_study": 5,
+        "cross_sectional": 4, "cross_sectional_study": 4,
+        "review": 3, "narrative_review": 3, "scoping_review": 3,
+        "animal_study": 2, "in_vitro": 2, "pilot_study": 2,
+        "thesis": 1, "other": 1,
         "case_report": 2, "expert_opinion": 1,
     },
     # --- (#2) Methodology gap-fill (one-time, weakness-targeted) ---
@@ -645,15 +700,6 @@ def get_research_config():
         cfg["low_end_n_ctx"] = le.get("n_ctx", 16384)
         cfg["low_end_deep_analysis_chunk_chars"] = le.get("deep_analysis_chunk_chars", 9000)
         cfg["low_end_deep_analysis_chunk_overlap"] = le.get("deep_analysis_chunk_overlap", 500)
-        # Consumed by study_analyser.StudyAnalyser for chunked deep analysis.
-        cfg["low_end_max_chunks_per_paper"] = le.get("max_chunks_per_paper", 4)
-        cfg["low_end_merge_study_summary"] = le.get("merge_study_summary", True)
-        # Low-end overrides for existing RESEARCH_CONFIG keys. Applied here (not
-        # by editing RESEARCH_CONFIG) so full mode is untouched.
-        for _k in ("max_study_text_length", "max_discovery_rounds",
-                   "num_focus_areas"):
-            if le.get(_k) is not None:
-                cfg[_k] = le[_k]
         cfg["low_end_synthesis_map_batch_chars"] = le.get("synthesis_map_batch_chars", 9000)
         cfg["low_end_synthesis_reduce_group_chars"] = le.get("synthesis_reduce_group_chars", 11000)
         return cfg
