@@ -2,6 +2,8 @@
 
 ## Demonstration
 
+Click the image below to watch the demo, note its very long, feel free to skip through, it's long because it's designed to be comprehensive on whatever subject your querying it about and accurate!
+
 [![Watch the demo](https://img.youtube.com/vi/Nc1L2j8ZuCg/maxresdefault.jpg)](https://youtu.be/Nc1L2j8ZuCg)
 
 ## Description
