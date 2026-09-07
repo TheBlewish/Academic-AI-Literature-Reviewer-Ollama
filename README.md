@@ -2,7 +2,7 @@
 
 ## Demonstration
 
-https://youtu.be/Nc1L2j8ZuCg?si=2yP3tpzMqN70hK07
+[![Watch the demo](https://img.youtube.com/vi/Nc1L2j8ZuCg/maxresdefault.jpg)](https://youtu.be/Nc1L2j8ZuCg)
 
 ## Description
 
