@@ -1,5 +1,9 @@
 # Academic-AI-Literature-Reviewer-Ollama
 
+## Demonstration
+
+https://youtu.be/Nc1L2j8ZuCg?si=2yP3tpzMqN70hK07
+
 ## Description
 
 **Academic-AI-Literature-Reviewer** is an automated literature review system that turns a locally run large language model, served through Ollama, into a research assistant that writes real, citable literature reviews.
