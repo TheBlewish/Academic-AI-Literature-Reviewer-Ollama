@@ -18,13 +18,14 @@ import os
 
 PRIMARY_LLM_CONFIG = {
     "llm_type": "ollama",
-    # Ollama endpoint. Override with the OLLAMA_BASE_URL env var if Ollama
-    # runs on another machine, e.g. http://192.168.1.50:11434
-    "base_url": os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
-    # Any instruction-following Ollama model. Larger is markedly better at
-    # the paper-selection and curation stages. Override with the
-    # ACADEMIC_LLM_MODEL env var, or edit this line.
-    "model_name": os.environ.get("ACADEMIC_LLM_MODEL", "qwen3.5:35b"),
+    # Ollama endpoint. Defaults to a local install; point OLLAMA_HOST at a
+    # remote box (e.g. "http://192.168.1.50:11434") to use one over the network.
+    "base_url": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
+    # Any model you have pulled in Ollama. Qwen3 is the default because it is a
+    # native thinking model, which this pipeline's task profiles are tuned
+    # around (see TASK_PROFILES: several stages set think ON deliberately).
+    # Override without editing this file:  export ACADEMIC_LLM_MODEL="..."
+    "model_name": os.environ.get("ACADEMIC_LLM_MODEL", "qwen3:32b"),
     "temperature": 0.1,
     "top_p": 0.9,
     "n_ctx": 65536,
@@ -324,7 +325,7 @@ SEARCH_APIS = {
     "openalex": {
         "enabled": True,
         "base_url": "https://api.openalex.org",
-        "email": os.environ.get("OPENALEX_EMAIL", "academic.researcher@example.com"),
+        "email": os.environ.get("OPENALEX_EMAIL", ""),
         "results_per_page": 25,
         "max_pages": 3,
         "rate_limit_delay": 0.2,
@@ -340,7 +341,7 @@ SEARCH_APIS = {
     "unpaywall": {
         "enabled": True,
         "base_url": "https://api.unpaywall.org/v2",
-        "email": os.environ.get("UNPAYWALL_EMAIL", "academic.researcher@example.com"),
+        "email": os.environ.get("UNPAYWALL_EMAIL", ""),
         "rate_limit_delay": 0.1,
     },
     "europe_pmc": {
@@ -353,7 +354,7 @@ SEARCH_APIS = {
     "crossref": {
         "enabled": True,
         "base_url": "https://api.crossref.org",
-        "email": os.environ.get("CROSSREF_EMAIL", "academic.researcher@example.com"),
+        "email": os.environ.get("CROSSREF_EMAIL", ""),
         "results_per_page": 20,
         "max_pages": 2,
         "rate_limit_delay": 0.15,
@@ -494,6 +495,16 @@ RESEARCH_CONFIG = {
     # never act. Total run time is bounded by search_time_budget_minutes plus
     # this.
     "post_review_max_minutes": 45,
+    # Retries the Phase 8b gate may request before it stops asking for more
+    # searching. Read via .get() with a code default of 2; stated here so it is
+    # visible and tunable rather than buried in the source.
+    "post_review_max_retries": 2,
+    # MINIMUM number of studies carrying at least one VERIFIED quote before a
+    # literature review may be written. This was read by the Phase 8b gate but
+    # never present in this file, so it silently used the code default of 3 and
+    # could not be tuned. It is now explicit, and (with abort_below_min_studies
+    # True, below) it is enforced rather than discarded when the budget expires.
+    "min_studies_for_review": 3,
     # Absolute ceiling on discovery + tangential rounds combined, whatever else
     # the routing decides. A backstop, not a target.
     "absolute_round_cap": 40,
@@ -530,6 +541,36 @@ RESEARCH_CONFIG = {
     # Refuse tangential while at least this many already-read studies were
     # discarded by the filter or curation and never used:
     "tangential_block_unused_pool": 10,
+
+    # ---- TANGENTIAL ESCALATION GATE (mirror of the entry gate) ----------
+    # The entry gate above only ever REFUSES tangential mode. Nothing forced
+    # it ON, so a run that acquired ZERO full texts could never read anything
+    # (main mode skips abstract-only papers by design) and every extra standard
+    # round was structurally incapable of changing the outcome — the observed
+    # 87-minute run that ended with a blank review and 0/8 full texts.
+    # When the pipeline is holding no readable direct evidence at all, but the
+    # catalog does contain abstract-bearing papers, tangential mode is the only
+    # mode that can read them, so it is engaged deterministically regardless of
+    # the model's sufficiency verdict.
+    # ---- HARD EVIDENCE FLOOR --------------------------------------------
+    # min_studies_for_review was read in exactly one place and then ignored:
+    # the Phase 8b gate printed "only 0 verified-quote study(ies) (< 3)" and
+    # synthesised anyway once the search budget ran out, because its only two
+    # outcomes were "search more" and "write it". With this True, falling below
+    # the floor ends the run with an explicit evidence report instead of a
+    # review. The report reproduces every study and verified quote found, so
+    # nothing is discarded. Set False to restore the old behaviour of
+    # synthesising a below-floor review anyway.
+    "abort_below_min_studies": True,
+
+    "tangential_escalate_on_no_readable_evidence": True,
+    # Standard rounds that must have run before the escalation may fire. Kept
+    # separate from min_standard_rounds_before_tangential so the refusal gate
+    # and the escalation gate can be tuned independently.
+    "escalate_min_standard_rounds": 3,
+    # Abstract-bearing papers the catalog must hold for the escalation to be
+    # worth taking (below this there is genuinely nothing to read).
+    "escalate_min_abstract_papers": 3,
 
     # Used to rank papers when curation deadlocks (curation_rescue_min_papers).
     # IMPORTANT: these keys must match the study_type strings the quick-read
