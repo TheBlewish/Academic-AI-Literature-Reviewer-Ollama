@@ -565,6 +565,16 @@ class ReviewState(TypedDict):
     post_review_retries: int
     _post_review_action: Optional[str]
     _tangential_curated_count_this_engagement: int
+    # Set by node_synthesize_review when zero studies reached deep analysis, so
+    # the document in literature_review is a no-evidence REPORT rather than a
+    # draft review. Read by node_self_review and node_verify_review to skip the
+    # repair loop. Declared here for the same reason as the fields above: an
+    # undeclared channel set in one node is dropped before the next one reads it.
+    _no_evidence_report: bool
+    # Set by node_post_deep_review when the verified evidence base is under
+    # min_studies_for_review and the search budget is spent. Read by
+    # node_synthesize_review. Declared for the same persistence reason as above.
+    _insufficient_evidence_reason: Optional[str]
 
 
 class AcademicReviewPipeline:
@@ -2601,6 +2611,65 @@ number. The "paper_index" field must still carry the numeric index."""
 
         return None, None, inv
 
+    def _abstract_only_paper_count(self) -> int:
+        """Papers in the catalog that have an abstract but no full text.
+
+        These are invisible to main mode by design (node_quick_read_studies
+        skips them) and readable ONLY in tangential mode, where quotes are
+        verified against the abstract.
+        """
+        try:
+            papers = self.discovery.get_all_papers()
+        except Exception:
+            return 0
+        return sum(1 for p in papers
+                   if not getattr(p, "full_text_available", False)
+                   and getattr(p, "abstract", None))
+
+    def _tangential_entry_force(self, state: ReviewState):
+        """Return (reason, inv) when tangential mode MUST be engaged, else (None, inv).
+
+        Counterpart to _tangential_entry_block. That gate only ever refuses
+        tangential mode; nothing ever forced it on. The consequence, observed in
+        a run that acquired 0 full texts from 8 papers: main mode skips every
+        abstract-only paper, so nothing is read, nothing is curated, nothing is
+        deep-analysed, and the review comes out blank — while the sufficiency
+        model keeps answering "bad_picks" and ordering more standard rounds that
+        cannot possibly help, because another standard round still cannot read an
+        abstract-only paper.
+
+        The condition is deliberately narrow: it fires ONLY when the pipeline is
+        holding no readable direct evidence whatsoever (no full text retrieved
+        all run AND nothing read into the evidence pool), while the catalog does
+        hold abstract-bearing papers that tangential mode could read. Any run
+        with even one full text or one read study is untouched by this.
+        """
+        cfg = self.config
+        inv = self._direct_evidence_inventory(state)
+
+        if not cfg.get("tangential_escalate_on_no_readable_evidence", True):
+            return None, inv
+        # Already in tangential mode — nothing to escalate.
+        if state.get("tangential_mode_active"):
+            return None, inv
+        # Any readable direct evidence at all means main mode still has a path.
+        if inv["full_text"] > 0 or inv["pool"] > 0 or inv["curated"] > 0:
+            return None, inv
+
+        min_rounds = int(cfg.get("escalate_min_standard_rounds", 3))
+        if inv["standard_rounds"] < min_rounds:
+            return None, inv
+
+        n_abstract = self._abstract_only_paper_count()
+        min_abstract = int(cfg.get("escalate_min_abstract_papers", 3))
+        if n_abstract < min_abstract:
+            return None, inv
+
+        return (f"{inv['catalog']} paper(s) in the catalog but 0 full texts "
+                f"retrieved and 0 studies read in {inv['standard_rounds']} "
+                f"standard round(s); {n_abstract} abstract-only paper(s) are "
+                f"readable only in tangential mode"), inv
+
     def node_evidence_sufficiency(self, state: ReviewState) -> ReviewState:
         self._print_phase_banner("PHASE 6: EVIDENCE SUFFICIENCY CHECK", color=Fore.MAGENTA)
 
@@ -2735,6 +2804,42 @@ shown for each study, e.g. (Smith et al., 2020), or narratively as Smith et al.
                     result.json_response["reasoning"] = (
                         f"[Overridden by the tangential entry gate: {block}.] "
                         + str(result.json_response.get("reasoning", "")))
+
+        # ---- TANGENTIAL ESCALATION GATE (deterministic) ---------------------
+        # The refusal gate above can only ever lock tangential mode. This one
+        # unlocks it when main mode has provably run out of road: no full text
+        # retrieved, nothing read, but abstract-bearing papers sitting in the
+        # catalog that only tangential mode is allowed to read. Applied whatever
+        # the model decided (including a failed call), because "run another
+        # standard round" cannot change an outcome that main mode's own
+        # full-text requirement has already determined.
+        force_reason, force_inv = self._tangential_entry_force(state)
+        if force_reason:
+            print(f"\n  {Fore.MAGENTA}{Style.BRIGHT}TANGENTIAL MODE FORCED"
+                  f"{Style.RESET_ALL}")
+            print(f"  {Fore.MAGENTA}{force_reason}.{Style.RESET_ALL}")
+            print(f"  {Fore.WHITE}Another standard round cannot read those papers "
+                  f"(main mode requires full text), so indirect/abstract evidence "
+                  f"is unlocked instead.{Style.RESET_ALL}")
+            print(f"  {Fore.WHITE}Catalog {force_inv['catalog']} | full text "
+                  f"{force_inv['full_text']} | read {force_inv['pool']} | "
+                  f"curated {force_inv['curated']}{Style.RESET_ALL}")
+            # Stagnation counted while main mode was structurally unable to use
+            # anything it found. Tangential mode uses a different planner AND
+            # different eligibility rules, so past stagnation no longer predicts
+            # the next round; leaving it set would trip the stop guard in
+            # _route_sufficiency and end the run at the moment of escalation.
+            state["stagnant_round_count"] = 0
+            prior = ""
+            if result.success and result.json_response:
+                prior = str(result.json_response.get("reasoning", ""))
+            state["last_sufficiency_decision"] = "sparse_direct_evidence"
+            state["sufficiency_reasoning"] = (
+                f"[Escalated by the tangential escalation gate: {force_reason}.] "
+                + prior).strip()
+            print(f"  {Fore.MAGENTA}{Style.BRIGHT}Decision: sparse_direct_evidence "
+                  f"(forced){Style.RESET_ALL}")
+            return state
 
         if not result.success or not result.json_response:
             print(f"  {Fore.RED}Sufficiency check failed — defaulting to 'sufficient'.{Style.RESET_ALL}")
@@ -3008,6 +3113,36 @@ shown for each study, e.g. (Smith et al., 2020), or narratively as Smith et al.
             return state
 
         if thin or weak:
+            # ---- HARD EVIDENCE FLOOR ---------------------------------------
+            # Previously this branch ALWAYS proceeded, which is how
+            # min_studies_for_review became a preference that was discarded the
+            # moment the clock ran out: the gate printed "only 0 verified-quote
+            # study(ies) (< 3)" and then synthesised anyway. Falling below the
+            # floor now ends the run with an explicit report instead of a review.
+            #
+            # Only the COUNT triggers the abort. A weak methodology across a
+            # sufficient number of studies is a real finding that belongs in the
+            # Limitations section, not a reason to withhold the review.
+            floor_enabled = bool(self.config.get("abort_below_min_studies", True))
+            if thin and floor_enabled:
+                print(f"  {Fore.RED}{Style.BRIGHT}BELOW THE EVIDENCE FLOOR — "
+                      f"no review will be written.{Style.RESET_ALL}")
+                print(f"  {Fore.WHITE}{n_verified} study(ies) carry verified "
+                      f"quotes; the configured minimum is {min_studies} "
+                      f"('min_studies_for_review'). Search budget is spent, so "
+                      f"there is no way to reach the floor this run.{Style.RESET_ALL}")
+                print(f"  {Fore.WHITE}An explicit evidence report will be produced "
+                      f"instead, including every study and verified quote found. "
+                      f"Set 'abort_below_min_studies': False to synthesise a "
+                      f"below-floor review anyway.{Style.RESET_ALL}")
+                state["_insufficient_evidence_reason"] = (
+                    f"{n_verified} study(ies) produced verified quotes, below the "
+                    f"configured minimum of {min_studies} "
+                    f"(min_studies_for_review), and the search budget "
+                    f"(rounds/retries/time) was exhausted before the floor could "
+                    f"be reached")
+                state["_post_review_action"] = "proceed"
+                return state
             print(f"  {Fore.YELLOW}Budget exhausted (round/retry/time limit) — "
                   f"proceeding to synthesis with the evidence on hand.{Style.RESET_ALL}")
         else:
@@ -4113,7 +4248,206 @@ Output ONLY this JSON (prose strings, no markdown headers inside them):
               f"{Style.RESET_ALL}")
         return state
 
+    def _build_no_evidence_report(self, state: ReviewState) -> str:
+        """Write an explicit account of WHY no review could be produced.
+
+        Reaching synthesis with zero analysed studies used to emit the two-word
+        string "Insufficient studies.", which the self-fix and verification
+        passes then spent ~20 minutes inflating into an empty seven-heading
+        skeleton that PASSED verification — a document that reported nothing and
+        looked like a successful run. A run that finds nothing should say so, in
+        full, with the numbers that explain it.
+        """
+        summary = self.discovery.get_catalog_summary()
+        papers = []
+        try:
+            papers = self.discovery.get_all_papers()
+        except Exception:
+            pass
+        abstract_only = [p for p in papers
+                         if not getattr(p, "full_text_available", False)
+                         and getattr(p, "abstract", None)]
+        no_text_at_all = [p for p in papers
+                          if not getattr(p, "full_text_available", False)
+                          and not getattr(p, "abstract", None)]
+
+        lines = [
+            "NO REVIEW PRODUCED — INSUFFICIENT RETRIEVABLE EVIDENCE",
+            "",
+            f'RESEARCH QUESTION: "{state.get("original_query", "")}"',
+            "",
+            "OUTCOME",
+            "No literature review was written because no study reached the "
+            "deep-analysis stage with verifiable text. This is a retrieval "
+            "outcome, not a finding about the research question: it says "
+            "nothing about whether the literature exists or what it concludes.",
+            "",
+        ]
+        floor_reason = state.get("_insufficient_evidence_reason")
+        if floor_reason:
+            # Below-floor variant: some evidence exists, it just did not reach
+            # min_studies_for_review. Replace the zero-evidence wording.
+            lines[0] = "NO REVIEW PRODUCED — EVIDENCE BELOW THE REQUIRED MINIMUM"
+            lines[5] = (
+                f"No literature review was written because {floor_reason}. "
+                f"Everything the run did find is reproduced in full below, so "
+                f"nothing is lost — it is simply not enough to support a review. "
+                f"This is a statement about what this run retrieved, not about "
+                f"what the literature contains.")
+        lines += [
+            "WHAT THE SEARCH ACTUALLY FOUND",
+            f"  Papers identified and catalogued: {summary.get('total_papers', 0)}",
+            f"  Full texts successfully retrieved: {summary.get('with_full_text', 0)}",
+            f"  Abstract only (no full text): {len(abstract_only)}",
+            f"  Neither full text nor abstract: {len(no_text_at_all)}",
+            f"  Standard search rounds completed: {state.get('discovery_round', 0)}",
+            f"  Tangential engagements: {state.get('tangential_engagement_count', 0)}",
+            "",
+        ]
+
+        if summary.get("total_papers", 0) and not summary.get("with_full_text", 0):
+            lines += [
+                "MOST LIKELY CAUSE",
+                "Papers were found but no full text could be downloaded for any "
+                "of them. Quotes are verified against retrieved text, so with no "
+                "text there is nothing to verify and nothing to quote. Check the "
+                "acquisition lines in the log above: repeated 'failed' entries "
+                "against a valid open-access DOI point at the download step "
+                "(publisher bot-blocking, network, or a missing UNPAYWALL_EMAIL) "
+                "rather than at the literature being unavailable.",
+                "",
+            ]
+        elif not summary.get("total_papers", 0):
+            lines += [
+                "MOST LIKELY CAUSE",
+                "No papers entered the catalog at all. Either the search APIs "
+                "returned nothing usable (check for rate-limit and missing-API-key "
+                "messages in the log) or the selection step rejected every "
+                "candidate.",
+                "",
+            ]
+        else:
+            n_kept = len(state.get("study_analyses") or [])
+            if floor_reason and n_kept:
+                lines += [
+                    "MOST LIKELY CAUSE",
+                    f"Retrieval and analysis worked — {n_kept} study(ies) came "
+                    f"through with usable text — but too few cleared quote "
+                    f"verification to meet the configured floor. Either the "
+                    f"question is genuinely thinly studied, or the search stopped "
+                    f"before it had covered the literature. The relevance-filter "
+                    f"and curation reasoning in the log above shows which.",
+                    "",
+                ]
+            else:
+                lines += [
+                    "MOST LIKELY CAUSE",
+                    "Papers with text were retrieved, but none survived reading, "
+                    "filtering, curation, and quote verification. Review the "
+                    "relevance-filter and curation reasoning in the log above.",
+                    "",
+                ]
+
+        if papers:
+            lines.append("PAPERS IDENTIFIED (catalogued but not usable as evidence)")
+            for p in papers:
+                status = ("full text" if getattr(p, "full_text_available", False)
+                          else ("abstract only" if getattr(p, "abstract", None)
+                                else "metadata only"))
+                lines.append(
+                    f"  - [{status}] "
+                    f"{apa_reference(p.authors, p.year, p.title, p.venue, p.doi)}")
+            lines.append("")
+
+        # ---- RETAINED EVIDENCE ----------------------------------------------
+        # An abort must never silently bin work the run actually completed. Any
+        # study that reached deep analysis is reproduced here with its verified
+        # quotes and APA reference, so a below-floor run still hands back
+        # everything it found in citable form.
+        analyses = state.get("study_analyses") or []
+        if analyses:
+            lines.append("EVIDENCE RETAINED (analysed, with verified quotes)")
+            lines.append(
+                "These studies were read and analysed successfully. They are "
+                "reproduced verbatim rather than discarded; the quotes below "
+                "passed the same verification a finished review would apply.")
+            lines.append("")
+            for i, a in enumerate(analyses, 1):
+                lines.append(
+                    f"  {i}. {apa_reference(a.get('paper_authors') or [], a.get('paper_year'), a.get('paper_title', '?'), a.get('paper_venue'), a.get('paper_doi'))}")
+                if a.get("study_type"):
+                    lines.append(f"     Design: {a.get('study_type')}")
+                verified = [q for q in (a.get("key_quotes") or [])
+                            if isinstance(q, dict) and q.get("verified") and q.get("quote")]
+                if verified:
+                    for q in verified:
+                        loc = q.get("source_section") or q.get("section_heading") or ""
+                        loc = f" [{loc}]" if loc else ""
+                        lines.append(f'     Verified quote{loc}: "{q.get("quote")}"')
+                        if q.get("context"):
+                            lines.append(f"       Context: {q.get('context')}")
+                else:
+                    lines.append("     No quote passed verification for this study.")
+                lines.append("")
+
+        lines.append("SUGGESTED NEXT STEPS")
+        if floor_reason:
+            lines += [
+                f"  1. Lower 'min_studies_for_review' (currently "
+                f"{int(self.config.get('min_studies_for_review', 3))}) if a "
+                f"smaller evidence base is acceptable for this question, or set "
+                f"'abort_below_min_studies': False to synthesise a below-floor "
+                f"review with the studies listed above.",
+                "  2. Raise the search budget — 'post_review_max_retries', "
+                "'post_review_max_minutes' or 'max_discovery_rounds' — so the "
+                "run has room to reach the floor before it stops.",
+                "  3. Re-run with broader search terms; the evidence above shows "
+                "the topic is not empty, only thinly retrieved.",
+            ]
+        else:
+            lines += [
+                "  1. Confirm UNPAYWALL_EMAIL is set to a real address.",
+                "  2. Add the free API keys the log reported as missing "
+                "(Semantic Scholar, CORE) — both raise the share of retrievable "
+                "open-access text considerably.",
+                "  3. Re-run the question; if papers are again found but never "
+                "downloaded, the failure is in acquisition and the search terms are "
+                "not the problem.",
+            ]
+        return "\n".join(lines)
+
     def node_synthesize_review(self, state: ReviewState) -> ReviewState:
+        # ---- ZERO-EVIDENCE SHORT CIRCUIT ------------------------------------
+        # Every synthesis path already bailed to "Insufficient studies." on an
+        # empty analyses list, but that stub was then handed to self-review,
+        # self-fix, and up to three verification passes, which turned it into an
+        # empty seven-section skeleton and declared it PASSED. Catch it once,
+        # here, write a truthful report instead, and flag it so the repair loop
+        # is skipped — there is nothing in a retrieval failure for those passes
+        # to fix.
+        if not state.get("study_analyses"):
+            self._print_phase_banner("PHASE 9: SYNTHESIS — NO EVIDENCE TO SYNTHESISE")
+            print(f"  {Fore.YELLOW}No study reached deep analysis with verifiable "
+                  f"text — writing an explicit no-evidence report instead of a "
+                  f"review.{Style.RESET_ALL}")
+            state["literature_review"] = self._build_no_evidence_report(state)
+            state["_no_evidence_report"] = True
+            return state
+        # ---- BELOW-FLOOR SHORT CIRCUIT --------------------------------------
+        # Phase 8b decided the verified evidence base is under
+        # min_studies_for_review and the search budget is spent. Same treatment:
+        # an honest report (which reproduces every study and verified quote
+        # found), and no repair loop — the shortfall is in the evidence, and no
+        # amount of rewriting can fix that.
+        if state.get("_insufficient_evidence_reason"):
+            self._print_phase_banner("PHASE 9: SYNTHESIS — EVIDENCE BELOW THE REQUIRED MINIMUM")
+            print(f"  {Fore.YELLOW}{state['_insufficient_evidence_reason']}."
+                  f"{Style.RESET_ALL}")
+            print(f"  {Fore.WHITE}Writing an evidence report that retains every "
+                  f"study and verified quote found.{Style.RESET_ALL}")
+            state["literature_review"] = self._build_no_evidence_report(state)
+            state["_no_evidence_report"] = True
+            return state
         if self._low_end:
             return self._node_synthesize_review_low_end(state)
         if self.config.get("two_phase_synthesis", True):
@@ -4559,6 +4893,17 @@ Output ONLY the complete review."""
             state["self_review_issues"] = []
             state["self_review_done"] = True
             return state
+        # A no-evidence report is a factual account of a retrieval failure, not a
+        # draft review. Critiquing it against literature-review structure only
+        # produces "missing Introduction/Method/References" issues that the fix
+        # passes cannot resolve, which is exactly the loop that turned a failed
+        # run into an empty skeleton.
+        if state.get("_no_evidence_report"):
+            print(f"  {Fore.YELLOW}No-evidence report — nothing to self-review."
+                  f"{Style.RESET_ALL}")
+            state["self_review_issues"] = []
+            state["self_review_done"] = True
+            return state
         if state.get("self_review_done"):
             print(f"  {Fore.YELLOW}Self-review already done.{Style.RESET_ALL}")
             return state
@@ -4735,7 +5080,7 @@ OUTPUT ONLY THE REVISED REVIEW — no preamble or markdown fences."""
     # ---------- Verification convergence helpers ----------
 
     def _super_critical_quote_rules(self) -> str:
-        """The strongest possible framing: hand-typing any
+        """The strongest possible framing (per James's spec): hand-typing any
         quotation, or copying evidence-base display text, is a SUPER-CRITICAL,
         review-breaking error that blocks the review from passing."""
         return (
@@ -6203,6 +6548,14 @@ INSTRUCTIONS:
         if not review:
             state["verification_passed"] = True
             return state
+        # The no-evidence report contains no quotes, no citations and no claims
+        # about the literature, so there is nothing for either the deterministic
+        # attribution check or the LLM pass to verify.
+        if state.get("_no_evidence_report"):
+            print(f"  {Fore.YELLOW}No-evidence report — no quotes or claims to "
+                  f"verify.{Style.RESET_ALL}")
+            state["verification_passed"] = True
+            return state
         state["verification_attempts"] = state.get("verification_attempts", 0) + 1
 
         analyses = state.get("study_analyses", [])
@@ -6670,6 +7023,8 @@ Respond with ONLY the title text."""
                 "curation_history": [],
                 "rounds_since_last_curation": 0,
                 "tangential_rounds_since_last_curation": 0,
+                "_no_evidence_report": False,
+                "_insufficient_evidence_reason": None,
                 # Run-bookkeeping for the Phase 8b gate (declared in ReviewState so
                 # they persist across nodes). run_start_time is also set in
                 # node_setup_review; initialising it here is harmless and keeps the
