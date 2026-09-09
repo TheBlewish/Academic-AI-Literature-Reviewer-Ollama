@@ -92,15 +92,6 @@ KNOWN_THINKING_MODEL_PATTERNS = [
     'sky-t1', 'reasoner', 'thinking', 'cot',
 ]
 
-# Models observed to reject the Ollama `think` field with an HTTP 400. Populated
-# at runtime on the first rejection and shared process-wide, so one bad response
-# teaches every agent and the field is never sent to that model again. This
-# exists because `think` is now sent whenever a caller or task profile states a
-# preference, not only for names matching the pattern list above — the pattern
-# list cannot know about every thinking-capable model (gemma4:31b emitted a
-# thinking block on calls logged as think=off, exhausting their budget).
-_THINK_UNSUPPORTED_MODELS = set()
-
 
 # =============================================================================
 # DYNAMIC CONTEXT SIZING  (ceiling semantics)
@@ -676,16 +667,7 @@ class LLMAgent:
             }
             if system_prompt:
                 payload["system"] = system_prompt
-            # Send `think` when the model is a KNOWN thinking model OR when the
-            # caller (or task profile) explicitly asked for a setting. Before
-            # this, `think` was sent ONLY for names matching
-            # KNOWN_THINKING_MODEL_PATTERNS, so a task profile requesting
-            # think=off on any other model silently sent nothing and the model
-            # used its own default — which is how a call logged as "think=off"
-            # spent its whole budget inside a thinking block. If a given model
-            # rejects the field, that is remembered and it is not sent again.
-            send_think = (self.is_thinking_model or think is not None)
-            if send_think and self.model_name not in _THINK_UNSUPPORTED_MODELS:
+            if self.is_thinking_model:
                 payload["think"] = effective_think
 
             # Check interrupt before even starting
@@ -709,38 +691,12 @@ class LLMAgent:
                 _register_response(response)
 
                 if response.status_code != 200:
-                    body = response.text[:400]
-                    # Older / non-thinking models reject the `think` field with a
-                    # 400. Remember that for this model, drop the field, and
-                    # re-issue the identical request once so behaviour is exactly
-                    # what it was before `think` started being sent explicitly.
-                    if (response.status_code == 400
-                            and "think" in body.lower()
-                            and "think" in payload):
-                        _THINK_UNSUPPORTED_MODELS.add(self.model_name)
-                        payload.pop("think", None)
-                        logger.debug(
-                            f"{self.model_name} rejected the 'think' field — "
-                            f"retrying without it and not sending it again.")
-                        _unregister_response(response)
-                        try:
-                            response.close()
-                        except Exception:
-                            pass
-                        response = requests.post(
-                            f"{self.base_url}/api/generate",
-                            json=payload,
-                            stream=True,
-                            timeout=(30, 600),
-                        )
-                        _register_response(response)
-                    if response.status_code != 200:
-                        return AgentResult(
-                            agent_id=self.agent_id, task_name="generate",
-                            error=f"HTTP {response.status_code}: {response.text[:200]}",
-                            elapsed_time=time.time() - start_time,
-                            was_retried=retried,
-                        )
+                    return AgentResult(
+                        agent_id=self.agent_id, task_name="generate",
+                        error=f"HTTP {response.status_code}: {response.text[:200]}",
+                        elapsed_time=time.time() - start_time,
+                        was_retried=retried,
+                    )
 
                 full_response = ""
                 full_thinking = ""
@@ -877,19 +833,9 @@ class LLMAgent:
         # the fix is simply MORE output budget so it can finish thinking AND
         # write the answer. Retry once with a bigger budget that still fits the
         # model window. Never retry on interrupts or genuine connection errors.
-        # NOTE: this deliberately does NOT require effective_think. A model that
-        # Ollama does not report as a thinking model (so `think` is never sent in
-        # the payload) can still emit a thinking block from its own template —
-        # gemma4:31b did exactly that, burning all 2048 tokens of a task profile
-        # marked think=off inside the think block and returning an empty answer.
-        # Because effective_think was False the retry was gated off, so
-        # refine_planning and title_generation failed outright and the run
-        # re-issued identical queries until it stagnated. The clause below
-        # already establishes that the answer came back EMPTY (a non-empty
-        # answer sets success=True and never reaches here), so a larger budget
-        # is the right response regardless of who asked for the thinking.
         should_retry = (
             (not result.success)
+            and effective_think
             and (result.truncated or (result.thinking and not result.response))
             and not is_interrupted()
             and not result.was_retried

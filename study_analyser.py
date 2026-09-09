@@ -838,6 +838,13 @@ def _split_text_into_chunks(text, chunk_chars, overlap, max_chunks=0):
     boundary — they appear whole in the following chunk.
 
     Returns a list of strings. A text shorter than one chunk returns [text].
+
+    max_chunks is an optional SPEED bound on calls per paper. 0 = unlimited =
+    read the whole paper, which is the correct behaviour and the point of this
+    mode. When a cap IS set and the paper needs more chunks than that, the
+    chunks are sampled EVENLY across the paper and the FIRST and LAST are always
+    kept. Papers put their findings and conclusions at the END, so truncating to
+    the first N chunks would reproduce the very bug this function exists to fix.
     """
     text = text or ""
     chunk_chars = max(int(chunk_chars or 0), 1000)
@@ -867,9 +874,18 @@ def _split_text_into_chunks(text, chunk_chars, overlap, max_chunks=0):
             chunks.append(chunk)
         if end >= n:
             break
-        if max_chunks and len(chunks) >= max_chunks:
-            break
         pos = max(end - overlap, pos + 1)
+
+    # Apply the optional cap by SAMPLING, never by truncating the tail.
+    if max_chunks and len(chunks) > max_chunks:
+        if max_chunks == 1:
+            return [chunks[-1]]
+        total = len(chunks)
+        idxs = sorted({
+            int(round(i * (total - 1) / (max_chunks - 1)))
+            for i in range(max_chunks)
+        })
+        chunks = [chunks[i] for i in idxs]
     return chunks
 
 
@@ -1557,8 +1573,23 @@ Be specific about findings — include actual numbers, effect sizes, p-values wh
             prompt = _build_deep_analysis_prompt(
                 paper, query, text_type, cap_clause,
                 chunk_text=chunk, chunk_header=header)
-            r = self.llm.run_primary(prompt, as_json=True,
-                                     task="deep_analysis_low_end")
+            # A chunk call can RAISE rather than return a failed result — a
+            # dropped connection, a socket timeout, Ollama restarting mid-run.
+            # Without this guard that exception propagates all the way out of
+            # deep_analysis and ends the entire review, discarding hours of
+            # completed work over one transient error. On a small machine doing
+            # 9+ calls per paper across dozens of papers, that is a near
+            # certainty over a long run. Treat it exactly like a failed chunk:
+            # log it, carry on, and keep whatever the other chunks produced.
+            try:
+                r = self.llm.run_primary(prompt, as_json=True,
+                                         task="deep_analysis_low_end")
+            except Exception as exc:
+                logger.warning(
+                    f"Low-end chunk {idx}/{len(chunks)} raised: {exc}")
+                print(f"{Fore.YELLOW}[chunk {idx} error]{Style.RESET_ALL}",
+                      end=" ", flush=True)
+                continue
             if not r.success or not r.json_response:
                 print(f"{Fore.YELLOW}[chunk {idx} failed]{Style.RESET_ALL}",
                       end=" ", flush=True)

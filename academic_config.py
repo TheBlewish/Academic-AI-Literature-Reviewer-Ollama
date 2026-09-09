@@ -18,14 +18,8 @@ import os
 
 PRIMARY_LLM_CONFIG = {
     "llm_type": "ollama",
-    # Ollama endpoint. Defaults to a local install; point OLLAMA_HOST at a
-    # remote box (e.g. "http://192.168.1.50:11434") to use one over the network.
-    "base_url": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
-    # Any model you have pulled in Ollama. Qwen3 is the default because it is a
-    # native thinking model, which this pipeline's task profiles are tuned
-    # around (see TASK_PROFILES: several stages set think ON deliberately).
-    # Override without editing this file:  export ACADEMIC_LLM_MODEL="..."
-    "model_name": os.environ.get("ACADEMIC_LLM_MODEL", "qwen3:32b"),
+    "base_url": os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"),
+    "model_name": os.environ.get("OLLAMA_MODEL", "qwen3.5:35b"),
     "temperature": 0.1,
     "top_p": 0.9,
     "n_ctx": 65536,
@@ -61,7 +55,7 @@ THINKING_CONFIG = {
 }
 
 # =============================================================================
-# LOW-END DEVICE MODE  (chunked execution for small machines, e.g. a NucBox)
+# LOW-END DEVICE MODE  (chunked execution for small machines)
 # =============================================================================
 # The FULL program is unchanged by default. Set low_end_device_mode to "yes" to
 # run complete reviews on a small-context device: every LLM call is capped to
@@ -85,20 +79,61 @@ THINKING_CONFIG = {
 LOW_END_CONFIG = {
     # MASTER TOGGLE — simple yes/no. "no" (default) = full behaviour, unchanged,
     # for the big machine. "yes" = chunked low-end mode for a small device.
-    "low_end_device_mode": "no",
+    # THIS IS THE LOW-END BRANCH, so it ships as "yes".
+    # Flip to "no" for full main-branch behaviour — nothing else in this dict is
+    # then read and PRIMARY_LLM_CONFIG takes over completely. You do not need to
+    # change branches if you later move to a bigger machine.
+    "low_end_device_mode": "yes",
 
     # Context window of the small device's model. Every call is capped here and
     # the chunk budgets below keep each call's input comfortably under it.
-    # Set to 8192 for the GMKtec NucBox M6 Ultra (Ryzen 5 7640HS / 16GB), which
-    # runs a ~14B model at low quant fast at 8K. Raise to 16384 if your small
-    # device has more headroom — the chunk sizes below still fit a 16K window.
-    "n_ctx": 8192,
+    "n_ctx": 16384,
 
     # OPTIONAL endpoint / model overrides for the small device. Leave BLANK ("")
     # to keep the PRIMARY_LLM_CONFIG values (e.g. if the same Ollama endpoint
     # serves the small model). Fill these if the small device differs.
-    "base_url": "",
-    "model_name": "",
+    # Endpoint / model for the small device. These OVERRIDE PRIMARY_LLM_CONFIG
+    # while low-end mode is on. Leave BLANK ("") to keep the PRIMARY values.
+    #
+    # RECOMMENDED MODELS (all comfortable on an 8GB card at Q4):
+    #   qwen3:8b     — best all-round pick; strong instruction-following and
+    #                  reliable JSON, which this pipeline lives on.
+    #   qwen3:4b     — noticeably faster, still holds the JSON contract.
+    #   llama3.1:8b  — solid alternative if you prefer the Llama family.
+    #
+    # Verbatim quoting is the one thing a small model must do well here. If your
+    # verified-quote counts look low, try a LARGER QUANT (Q5_K_M) before a
+    # different model — quantisation hurts exact reproduction more than size.
+    "base_url": os.environ.get("LOW_END_OLLAMA_BASE_URL", "http://localhost:11434"),
+    "model_name": os.environ.get("LOW_END_OLLAMA_MODEL", "qwen3:8b"),
+
+    # ---- HARD OUTPUT BUDGET ---------------------------------------------
+    # num_predict and num_ctx come out of the SAME window. Several full-mode
+    # profiles legitimately ask for 8192-16384 output tokens (synthesis,
+    # verification, self_fix, curate_evidence, methodology_assessment, qa_mode).
+    # At n_ctx 65536 that is fine. At 8-16K those budgets meet or EXCEED the
+    # whole window, leaving zero or negative room for the prompt — the model
+    # generates into a window that has evicted its own input. get_task_profile()
+    # caps every task to this while low-end mode is on.
+    "max_output_tokens": 3072,
+
+    # ---- THINKING SUPPRESSION -------------------------------------------
+    # A think=True profile has its output budget multiplied by
+    # THINKING_CONFIG["thinking_token_multiplier"], because the <think> block
+    # and the answer share one num_predict. On a small window that eats the
+    # window again. True (default) forces think=False on every task in low-end
+    # mode. Set False only if you run a small REASONING model at a raised n_ctx.
+    "force_think_off": True,
+
+    # ---- DISCOVERY SEARCH CAPS ------------------------------------------
+    # Paper selection shows the model every candidate from a search round in ONE
+    # call (~700 chars per paper). A full-mode round pulls up to 20 per API
+    # across 5 APIs — ~120 candidates, ~28000 tokens. That fits 65536 and does
+    # not fit 16384. These caps shrink the pool at the SOURCE, and also cut
+    # wall-clock time and API load a lot on a slow machine. Discovery quality is
+    # preserved by the round structure: fewer candidates per round, same rounds.
+    "search_results_per_page": 5,
+    "search_max_pages": 1,
 
     # ---- Chunk budgets (characters; ~3 chars/token) ----
     # deep_analysis: sequential paper chunk size + overlap between chunks.
@@ -117,7 +152,19 @@ LOW_END_CONFIG = {
     "synthesis_reduce_group_chars": 7000,
 
     # ---- Corpus caps so discovery-stage holistic calls fit the small window ----
-    "max_total_papers": 60,
+    # ---- Per-paper chunk cap (SPEED knob) --------------------------------
+    # 0 = UNLIMITED = read the whole paper. That is the default and the point of
+    # this mode. If a run is too slow you can set e.g. 5; chunks are then sampled
+    # EVENLY across the paper with the first and last always kept, so the
+    # abstract and conclusion are never what gets dropped. Costs coverage —
+    # reducing max_discovery_rounds saves more time for less quality.
+    "max_chunks_per_paper": 0,
+    # One extra SMALL call per chunked paper merging the per-chunk notes into the
+    # study summary synthesis uses. Input is a few short notes, never paper text.
+    "merge_study_summary": True,
+
+    # ---- Corpus caps so discovery-stage holistic calls fit the window ----
+    "max_total_papers": 40,
     "target_papers_per_focus_area": 3,
 }
 
@@ -169,8 +216,8 @@ TASK_PROFILES = {
     # e.g. 8192) caps it lower anyway. The output budget is small (2048) so that
     # one ~6000-char chunk + the prompt scaffolding + this output all fit inside
     # an 8K window without the no-truncation guarantee having to push the window
-    # above the device's limit. think is off (a small instruct model on a NucBox
-    # should not burn the tiny budget on a <think> block). This profile is NEVER
+    # above the device's limit. think is off (a small instruct model on a
+    # low-memory box should not burn the tiny budget on a <think> block). This profile is NEVER
     # consulted in full mode — deep_analysis only requests it under low-end.
     "deep_analysis_low_end": {
         "num_ctx": 8192,
@@ -325,7 +372,7 @@ SEARCH_APIS = {
     "openalex": {
         "enabled": True,
         "base_url": "https://api.openalex.org",
-        "email": os.environ.get("OPENALEX_EMAIL", ""),
+        "email": os.environ.get("OPENALEX_EMAIL", "your.email@example.com"),
         "results_per_page": 25,
         "max_pages": 3,
         "rate_limit_delay": 0.2,
@@ -341,7 +388,7 @@ SEARCH_APIS = {
     "unpaywall": {
         "enabled": True,
         "base_url": "https://api.unpaywall.org/v2",
-        "email": os.environ.get("UNPAYWALL_EMAIL", ""),
+        "email": os.environ.get("UNPAYWALL_EMAIL", "your.email@example.com"),
         "rate_limit_delay": 0.1,
     },
     "europe_pmc": {
@@ -354,7 +401,7 @@ SEARCH_APIS = {
     "crossref": {
         "enabled": True,
         "base_url": "https://api.crossref.org",
-        "email": os.environ.get("CROSSREF_EMAIL", ""),
+        "email": os.environ.get("CROSSREF_EMAIL", "your.email@example.com"),
         "results_per_page": 20,
         "max_pages": 2,
         "rate_limit_delay": 0.15,
@@ -495,16 +542,6 @@ RESEARCH_CONFIG = {
     # never act. Total run time is bounded by search_time_budget_minutes plus
     # this.
     "post_review_max_minutes": 45,
-    # Retries the Phase 8b gate may request before it stops asking for more
-    # searching. Read via .get() with a code default of 2; stated here so it is
-    # visible and tunable rather than buried in the source.
-    "post_review_max_retries": 2,
-    # MINIMUM number of studies carrying at least one VERIFIED quote before a
-    # literature review may be written. This was read by the Phase 8b gate but
-    # never present in this file, so it silently used the code default of 3 and
-    # could not be tuned. It is now explicit, and (with abort_below_min_studies
-    # True, below) it is enforced rather than discarded when the budget expires.
-    "min_studies_for_review": 3,
     # Absolute ceiling on discovery + tangential rounds combined, whatever else
     # the routing decides. A backstop, not a target.
     "absolute_round_cap": 40,
@@ -541,36 +578,6 @@ RESEARCH_CONFIG = {
     # Refuse tangential while at least this many already-read studies were
     # discarded by the filter or curation and never used:
     "tangential_block_unused_pool": 10,
-
-    # ---- TANGENTIAL ESCALATION GATE (mirror of the entry gate) ----------
-    # The entry gate above only ever REFUSES tangential mode. Nothing forced
-    # it ON, so a run that acquired ZERO full texts could never read anything
-    # (main mode skips abstract-only papers by design) and every extra standard
-    # round was structurally incapable of changing the outcome — the observed
-    # 87-minute run that ended with a blank review and 0/8 full texts.
-    # When the pipeline is holding no readable direct evidence at all, but the
-    # catalog does contain abstract-bearing papers, tangential mode is the only
-    # mode that can read them, so it is engaged deterministically regardless of
-    # the model's sufficiency verdict.
-    # ---- HARD EVIDENCE FLOOR --------------------------------------------
-    # min_studies_for_review was read in exactly one place and then ignored:
-    # the Phase 8b gate printed "only 0 verified-quote study(ies) (< 3)" and
-    # synthesised anyway once the search budget ran out, because its only two
-    # outcomes were "search more" and "write it". With this True, falling below
-    # the floor ends the run with an explicit evidence report instead of a
-    # review. The report reproduces every study and verified quote found, so
-    # nothing is discarded. Set False to restore the old behaviour of
-    # synthesising a below-floor review anyway.
-    "abort_below_min_studies": True,
-
-    "tangential_escalate_on_no_readable_evidence": True,
-    # Standard rounds that must have run before the escalation may fire. Kept
-    # separate from min_standard_rounds_before_tangential so the refusal gate
-    # and the escalation gate can be tuned independently.
-    "escalate_min_standard_rounds": 3,
-    # Abstract-bearing papers the catalog must hold for the escalation to be
-    # worth taking (below this there is genuinely nothing to read).
-    "escalate_min_abstract_papers": 3,
 
     # Used to rank papers when curation deadlocks (curation_rescue_min_papers).
     # IMPORTANT: these keys must match the study_type strings the quick-read
@@ -720,7 +727,29 @@ def get_parallel_config():
         "agent_start_delay": 2.0,
     }
 
+def _low_end_search_caps(api_cfg):
+    """COPY of one API's config with the low-end paging caps applied. Endpoints,
+    keys, fields and rate limits pass through untouched; SEARCH_APIS is never
+    mutated, so toggling low-end off restores full behaviour exactly."""
+    le = LOW_END_CONFIG
+    capped = dict(api_cfg)
+    rpp = le.get("search_results_per_page")
+    mp = le.get("search_max_pages")
+    if rpp and capped.get("results_per_page"):
+        capped["results_per_page"] = min(int(capped["results_per_page"]), int(rpp))
+    if mp and capped.get("max_pages"):
+        capped["max_pages"] = min(int(capped["max_pages"]), int(mp))
+    return capped
+
+
 def get_search_api_config(api_name=None):
+    # In low-end mode, shrink each round's candidate pool at the source so the
+    # holistic paper-selection call fits a small window. Full mode returns the
+    # original objects, unchanged.
+    if is_low_end_enabled():
+        if api_name:
+            return _low_end_search_caps(SEARCH_APIS.get(api_name, {}))
+        return {k: _low_end_search_caps(v) for k, v in SEARCH_APIS.items()}
     if api_name:
         return SEARCH_APIS.get(api_name, {})
     return SEARCH_APIS
@@ -743,6 +772,8 @@ def get_research_config():
         cfg["low_end_deep_analysis_chunk_overlap"] = le.get("deep_analysis_chunk_overlap", 500)
         cfg["low_end_synthesis_map_batch_chars"] = le.get("synthesis_map_batch_chars", 9000)
         cfg["low_end_synthesis_reduce_group_chars"] = le.get("synthesis_reduce_group_chars", 11000)
+        cfg["low_end_max_chunks_per_paper"] = le.get("max_chunks_per_paper", 0)
+        cfg["low_end_merge_study_summary"] = le.get("merge_study_summary", True)
         return cfg
     return RESEARCH_CONFIG
 
@@ -771,4 +802,42 @@ def get_paths_config():
     return PATHS_CONFIG
 
 def get_task_profile(task_name):
-    return TASK_PROFILES.get(task_name)
+    """Return the per-task context/output/thinking profile.
+
+    This is the SINGLE chokepoint every LLM call passes through
+    (llm_manager._resolve_task_overrides calls it for every task-tagged call),
+    so capping here constrains the whole pipeline without touching any call site.
+
+    FULL MODE IS UNCHANGED: with low_end_device_mode "no" this returns the
+    original TASK_PROFILES object exactly as before.
+
+    In LOW-END MODE it returns a capped COPY (TASK_PROFILES is never mutated) so
+    that for every task: max_tokens <= max_output_tokens, think is forced False
+    when force_think_off is set, and num_ctx <= the low-end n_ctx.
+    """
+    profile = TASK_PROFILES.get(task_name)
+    if profile is None or not is_low_end_enabled():
+        return profile
+
+    le = LOW_END_CONFIG
+    capped = dict(profile)
+
+    max_out = le.get("max_output_tokens")
+    try:
+        max_out = int(max_out) if max_out else 0
+    except (TypeError, ValueError):
+        max_out = 0
+    if max_out > 0:
+        capped["max_tokens"] = min(int(capped.get("max_tokens", max_out)), max_out)
+
+    if _truthy_yes_no(le.get("force_think_off", True)):
+        capped["think"] = False
+
+    try:
+        n_ctx = int(le.get("n_ctx") or 0)
+    except (TypeError, ValueError):
+        n_ctx = 0
+    if n_ctx > 0 and capped.get("num_ctx"):
+        capped["num_ctx"] = min(int(capped["num_ctx"]), n_ctx)
+
+    return capped
