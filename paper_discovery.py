@@ -209,7 +209,7 @@ class SemanticScholarClient:
 class OpenAlexClient:
     def __init__(self, config: Dict):
         self.base_url = config.get("base_url", "https://api.openalex.org")
-        self.email = config.get("email", "academic.researcher@example.com")
+        self.email = _usable_email(config.get("email"))
         self.results_per_page = config.get("results_per_page", 25)
         self.max_pages = config.get("max_pages", 3)
         self.rate_limit_delay = config.get("rate_limit_delay", 0.2)
@@ -224,9 +224,12 @@ class OpenAlexClient:
             page = 1
             while len(papers) < total_to_fetch:
                 params = {"search": query, "per_page": min(self.results_per_page, total_to_fetch - len(papers)),
-                          "page": page, "mailto": self.email, "sort": "cited_by_count:desc",
+                          "page": page, "sort": "cited_by_count:desc",
                           "select": "id,doi,title,authorships,publication_year,primary_location,"
                                     "cited_by_count,type,abstract_inverted_index,open_access,biblio"}
+                # Only sent when configured — an empty mailto is worse than none.
+                if self.email:
+                    params["mailto"] = self.email
                 resp = requests.get(f"{self.base_url}/works", params=params, timeout=30)
                 if resp.status_code != 200:
                     error = f"HTTP {resp.status_code}: {resp.text[:200]}"
@@ -258,7 +261,8 @@ class OpenAlexClient:
         try:
             doi_clean = doi.replace("https://doi.org/", "")
             resp = requests.get(f"{self.base_url}/works/https://doi.org/{doi_clean}",
-                                params={"mailto": self.email}, timeout=15)
+                                params=({"mailto": self.email} if self.email else {}),
+                                timeout=15)
             if resp.status_code == 200:
                 return self._parse(resp.json())
         except Exception:
@@ -497,7 +501,7 @@ class CrossrefClient:
     """Crossref REST API — free, no auth, mailto for polite pool (10 req/s)."""
     def __init__(self, config: Dict):
         self.base_url = config.get("base_url", "https://api.crossref.org")
-        self.email = config.get("email", "academic.researcher@example.com")
+        self.email = _usable_email(config.get("email"))
         self.results_per_page = config.get("results_per_page", 20)
         self.max_pages = config.get("max_pages", 2)
         self.rate_limit_delay = config.get("rate_limit_delay", 0.15)
@@ -516,14 +520,18 @@ class CrossrefClient:
                     "rows": min(self.results_per_page, total_to_fetch - offset),
                     "offset": offset,
                     "sort": "relevance",
-                    "mailto": self.email,
                 }
+                # Polite-pool identification, only when actually configured.
+                if self.email:
+                    params["mailto"] = self.email
+                ua = (f"AcademicLitReview/1.0 (mailto:{self.email})"
+                      if self.email else "AcademicLitReview/1.0")
                 resp = requests.get(f"{self.base_url}/works", params=params, timeout=30,
-                                    headers={"User-Agent": f"AcademicLitReview/1.0 (mailto:{self.email})"})
+                                    headers={"User-Agent": ua})
                 if resp.status_code == 429:
                     time.sleep(5)
                     resp = requests.get(f"{self.base_url}/works", params=params, timeout=30,
-                                        headers={"User-Agent": f"AcademicLitReview/1.0 (mailto:{self.email})"})
+                                        headers={"User-Agent": ua})
                 if resp.status_code != 200:
                     error = f"HTTP {resp.status_code}: {resp.text[:200]}"
                     break
@@ -602,14 +610,37 @@ class CrossrefClient:
             return None
 
 
+def _usable_email(value: Optional[str]) -> str:
+    """Return a contact email only if it is actually usable, else "".
+
+    The bundled config ships EMPTY email defaults so no maintainer's address is
+    committed to source control. An empty (or placeholder) address must never be
+    sent to an API: Unpaywall rejects the request outright, and OpenAlex /
+    Crossref would receive a meaningless `mailto=` that forfeits polite-pool
+    access without saying why. Every consumer routes through this so the "no
+    email configured" case is handled in one place.
+    """
+    if not value:
+        return ""
+    v = str(value).strip()
+    if not v or "@" not in v or "example.com" in v.lower():
+        return ""
+    return v
+
+
 class UnpaywallClient:
     def __init__(self, config: Dict):
         self.base_url = config.get("base_url", "https://api.unpaywall.org/v2")
-        self.email = config.get("email", "academic.researcher@example.com")
+        self.email = _usable_email(config.get("email"))
         self.rate_limit_delay = config.get("rate_limit_delay", 0.1)
-        self._email_valid = "example.com" not in self.email
+        # Unpaywall REQUIRES a real address. An unset or placeholder value used
+        # to slip through the old "example.com" test (an empty string contains
+        # no "example.com"), so every lookup failed at the API with no
+        # explanation. Anything not usable is now caught here, up front.
+        self._email_valid = bool(self.email)
         if not self._email_valid:
-            print(f"{Fore.YELLOW}  \u26a0 Unpaywall: email is 'example.com' — will reject requests.{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}  \u26a0 Unpaywall: no valid email configured — "
+                  f"full-text lookups will be skipped.{Style.RESET_ALL}")
             print(f"{Fore.YELLOW}    Fix: export UNPAYWALL_EMAIL=\"your.real@email.com\"{Style.RESET_ALL}")
 
     def find_open_access(self, doi: str) -> Dict:
@@ -980,10 +1011,42 @@ class PaperDiscoveryEngine:
 
         return successes, failures
 
+    # Publisher platforms that front their open-access PDFs with a bot filter
+    # (MDPI and Oxford/Silverchair are both behind Cloudflare) answer 403 to a
+    # self-identifying bot User-Agent, so a fully open-access article reads as
+    # "failed" even though Unpaywall handed us a valid PDF URL. This was the
+    # observed cause of 0/8 full texts on a run whose very first paper was an
+    # MDPI (10.3390) article. A browser-like header set is sent first, and any
+    # bot-block status is retried once with the polite research UA — nothing is
+    # skipped that used to succeed, only added attempts on failure.
+    _BROWSER_HEADERS = {
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "Accept": ("text/html,application/xhtml+xml,application/pdf,"
+                   "application/xml;q=0.9,*/*;q=0.8"),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    _POLITE_HEADERS = {
+        "User-Agent": "Academic-Literature-Review-Bot/1.0 (Research)",
+        "Accept": "application/pdf,text/html;q=0.9,*/*;q=0.8",
+    }
+    # Statuses that indicate a bot filter / access gate rather than a missing
+    # document, and are therefore worth one retry with the other header set.
+    _BLOCK_STATUSES = (401, 403, 406, 418, 429)
+
     def _download_and_extract(self, paper: PaperMetadata, url: str, method: str) -> bool:
         try:
-            resp = requests.get(url, timeout=30, allow_redirects=True, headers={
-                "User-Agent": "Academic-Literature-Review-Bot/1.0 (Research)"})
+            resp = requests.get(url, timeout=30, allow_redirects=True,
+                                headers=self._BROWSER_HEADERS)
+            if resp.status_code in self._BLOCK_STATUSES:
+                logger.debug(f"HTTP {resp.status_code} on {url} — retrying with "
+                             f"the research User-Agent")
+                try:
+                    resp = requests.get(url, timeout=30, allow_redirects=True,
+                                        headers=self._POLITE_HEADERS)
+                except Exception as e:
+                    logger.debug(f"Header-swap retry failed {url}: {e}")
+                    return False
             if resp.status_code != 200:
                 return False
             content = resp.content
