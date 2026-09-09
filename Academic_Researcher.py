@@ -5080,7 +5080,7 @@ OUTPUT ONLY THE REVISED REVIEW — no preamble or markdown fences."""
     # ---------- Verification convergence helpers ----------
 
     def _super_critical_quote_rules(self) -> str:
-        """The strongest possible framing (per James's spec): hand-typing any
+        """The strongest possible framing: hand-typing any
         quotation, or copying evidence-base display text, is a SUPER-CRITICAL,
         review-breaking error that blocks the review from passing."""
         return (
